@@ -455,7 +455,7 @@ def _ws_connect(url,headers):
 
 async def start_feed():
     if USE_MOCK:
-        from mock_feed import start_mock_feed
+        from backend.mock_feed import start_mock_feed
         await start_mock_feed(broadcast); return
     headers={"Authorization":f"Bearer {state.access_token}","Accept":"*/*"}
     while True:
@@ -485,7 +485,7 @@ async def start_feed():
 async def startup():
     print(f"  RAIMA Markets v3  |  {'MOCK' if USE_MOCK else 'LIVE'}  |  ws={websockets.__version__}")
     if USE_MOCK:
-        from mock_feed import start_mock_feed
+        from backend.mock_feed import start_mock_feed
         state.feed_task=asyncio.create_task(start_mock_feed(broadcast))
     elif state.access_token:
         state.feed_task=asyncio.create_task(start_feed())
