@@ -597,7 +597,9 @@ function round2(n){return Math.round(n*100)/100}
 // ═══════════════════════════════════════════════════════
 function connectWS(){
   setLive("connecting");
-  ws=new WebSocket(`ws://${location.host}/ws/feed`);
+  // ws=new WebSocket(`ws://${location.host}/ws/feed`);
+  const WS_PROTO = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(WS_PROTO + "://" + location.host + "/ws/feed");
   ws.onopen=()=>{setLive("live");document.getElementById("wsState").textContent="OPEN"};
   ws.onmessage=e=>{try{handleMsg(JSON.parse(e.data))}catch(ex){}};
   ws.onclose=()=>{setLive("offline");document.getElementById("wsState").textContent="CLOSED";setTimeout(connectWS,3000)};
