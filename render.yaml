@@ -2,21 +2,23 @@ services:
   - type: web
     name: raima-markets
     runtime: python
-    region: singapore          # closest to India
+    region: singapore
     plan: free
     rootDir: .
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: UPSTOX_API_KEY
-        sync: false            # set manually in Render dashboard
+        value: 8e11a453-2de7-4b87-9e02-986a0661d762
       - key: UPSTOX_API_SECRET
         sync: false
       - key: UPSTOX_ACCESS_TOKEN
         sync: false
       - key: UPSTOX_REDIRECT_URI
-        sync: false            # set to: https://YOUR-APP.onrender.com/auth/callback
+        value: https://trading-dashboard-15ld.onrender.com/auth/callback
       - key: MOCK_MODE
         value: "false"
+      - key: DASHBOARD_PASSWORD
+        value: raima2024
       - key: PYTHON_VERSION
         value: "3.11.0"
