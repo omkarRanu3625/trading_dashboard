@@ -153,17 +153,19 @@ class LOCEngine:
         st.spot.low   = low   or ltp
         st.spot.ts    = ts
 
-        # Check ATM change → swap ITM-2
+        # Check ATM change → swap ITM-2 (debounced)
         step = STRIKE_STEPS.get(symbol.upper(), 50)
         new_atm = round(round(ltp / step) * step, 2)
         if new_atm != st.last_atm:
             st.last_atm = new_atm
             ce_s, pe_s = get_itm2_strikes(ltp, symbol)
             if ce_s != st.ce_strike or pe_s != st.pe_strike:
-                print(f"[LOC] {symbol} ATM shift → CE:{ce_s} PE:{pe_s}")
+                print(f"[LOC] {symbol} ITM-2 shift → CE:{ce_s} PE:{pe_s}")
                 st.ce_strike = ce_s
                 st.pe_strike = pe_s
                 self._load_from_chain(symbol)
+                # Fetch fresh chain for new strikes in background
+                asyncio.create_task(self._refresh_chain(symbol))
 
         self._recalc(symbol)
 
@@ -197,23 +199,40 @@ class LOCEngine:
         if not st or not st.option_chain: return
         ce_row = st.option_chain.get(st.ce_strike, {})
         pe_row = st.option_chain.get(st.pe_strike, {})
+
+        def best_price(*vals):
+            """Return first non-zero value."""
+            for v in vals:
+                if v and v != 0: return v
+            return 0
+
         if ce_row.get("CE"):
             c = ce_row["CE"]
-            st.ce.ltp    = c.get("ltp", 0)
-            st.ce.close  = c.get("close", 0)
-            st.ce.high   = c.get("high", 0)
-            st.ce.low    = c.get("low", 0)
+            ce_ltp   = best_price(c.get("ltp",0), c.get("close",0))
+            ce_close = best_price(c.get("close",0), c.get("ltp",0))
+            st.ce.ltp    = ce_ltp
+            st.ce.close  = ce_close
+            st.ce.high   = best_price(c.get("high",0), ce_ltp)
+            st.ce.low    = best_price(c.get("low",0),  ce_ltp)
+            st.ce.oi     = c.get("oi", 0)
             st.ce.iv     = c.get("iv", 0)
             st.ce.instrument_key = ce_row.get("instrument_key_ce", "")
+
         if pe_row.get("PE"):
             p = pe_row["PE"]
-            st.pe.ltp    = p.get("ltp", 0)
-            st.pe.close  = p.get("close", 0)
-            st.pe.high   = p.get("high", 0)
-            st.pe.low    = p.get("low", 0)
+            pe_ltp   = best_price(p.get("ltp",0), p.get("close",0))
+            pe_close = best_price(p.get("close",0), p.get("ltp",0))
+            st.pe.ltp    = pe_ltp
+            st.pe.close  = pe_close
+            st.pe.high   = best_price(p.get("high",0), pe_ltp)
+            st.pe.low    = best_price(p.get("low",0),  pe_ltp)
+            st.pe.oi     = p.get("oi", 0)
             st.pe.iv     = p.get("iv", 0)
             st.pe.instrument_key = pe_row.get("instrument_key_pe", "")
-        print(f"[LOC] {symbol} chain loaded: CE@{st.ce_strike}={st.ce.ltp} PE@{st.pe_strike}={st.pe.ltp}")
+
+        print(f"[LOC] {symbol} ITM-2 data: "
+              f"CE@{st.ce_strike} ltp={st.ce.ltp} close={st.ce.close} key={st.ce.instrument_key[:20] if st.ce.instrument_key else 'none'} | "
+              f"PE@{st.pe_strike} ltp={st.pe.ltp} close={st.pe.close} key={st.pe.instrument_key[:20] if st.pe.instrument_key else 'none'}")
         self._recalc(symbol)
 
     def _recalc(self, symbol: str):
@@ -227,6 +246,10 @@ class LOCEngine:
         st.loc_result = result
         if self.on_loc_update:
             asyncio.create_task(self.on_loc_update(symbol, result))
+
+    # Public alias for external callers
+    def recalc(self, symbol: str):
+        return self._recalc(symbol)
 
     async def _refresh_chain(self, symbol: str):
         if not self.access_token: return
