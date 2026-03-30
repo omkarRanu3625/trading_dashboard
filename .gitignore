@@ -32,3 +32,5 @@ Thumbs.db
 
 # Logs
 *.log
+/frontend/node_modules/
+
