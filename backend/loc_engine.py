@@ -1,13 +1,17 @@
 """
-loc_engine.py v10 — Fixed CE@0 PE@0 bug
-Critical fix: _load_from_chain now uses spot_price from chain response
-(underlying_spot_price field) to calculate ITM-2 strikes,
-so we don't need to wait for WS spot tick before options are set.
+loc_engine.py v11 — Complete rewrite fixing:
+1. ITM-2 strikes: CE = ATM-2*step (call IN the money = strike below spot)
+                  PE = ATM+2*step (put IN the money = strike above spot)
+2. Use close_price as fallback when ltp is near 0 (expiry day/weekend)
+3. Real-time WS option price updates work correctly
+4. ATM debounce to avoid thrashing on minor spot moves
+5. chain_spot used correctly for initial strike calculation
 """
 import asyncio, time
 from dataclasses import dataclass, field
 from typing import Optional, Callable, Dict
 from .instruments import get_itm2_strikes, STRIKE_STEPS
+
 
 @dataclass
 class SpotData:
@@ -17,6 +21,21 @@ class SpotData:
 class OptionData:
     ltp:float=0; close:float=0; high:float=0; low:float=0
     oi:float=0; iv:float=0; instrument_key:str=""
+
+    @property
+    def effective_ltp(self) -> float:
+        """Use close if ltp is near 0 (expiry day / market closed)."""
+        if self.ltp and self.ltp >= 1.0:
+            return self.ltp
+        return self.close or self.ltp
+
+    @property
+    def effective_high(self) -> float:
+        return self.high or self.effective_ltp
+
+    @property
+    def effective_low(self) -> float:
+        return self.low or self.effective_ltp
 
 @dataclass
 class SymbolState:
@@ -29,23 +48,40 @@ class SymbolState:
     option_chain:dict=field(default_factory=dict)
     loc_result:dict=field(default_factory=dict)
     last_atm:float=0
-    chain_spot:float=0   # ← spot price from chain response
+    chain_spot:float=0
 
 
-def calc_loc_25(s, sc, sh, sl, so,
+def calc_loc_25(spot_ltp, spot_close, spot_high, spot_low, spot_open,
                 ce_ltp, ce_close, ce_high, ce_low,
                 pe_ltp, pe_close, pe_high, pe_low) -> dict:
-    """All 25 LOC formulas."""
-    s = s or 1; sc = sc or s; sh = sh or s; sl = sl or s
+    """
+    All 25 LOC formulas.
+    Uses effective ltp (falls back to close when ltp ≈ 0).
+    """
+    s  = spot_ltp   or 1
+    sc = spot_close or s
+    sh = spot_high  or s
+    sl = spot_low   or s
+
+    # Use effective prices (fallback close when ltp near 0)
+    ce_l = ce_ltp   if ce_ltp  >= 1.0 else (ce_close  or ce_ltp  or 0)
+    ce_c = ce_close or ce_l
+    ce_h = ce_high  or ce_l
+    ce_lo= ce_low   or ce_l
+
+    pe_l = pe_ltp   if pe_ltp  >= 1.0 else (pe_close  or pe_ltp  or 0)
+    pe_c = pe_close or pe_l
+    pe_h = pe_high  or pe_l
+    pe_lo= pe_low   or pe_l
 
     def sd(a, b): return (a/b) if b else 0
 
-    f1 = sd(max(ce_high or 0, ce_close or 0), max(sh, sc))
-    f2 = sd(min(ce_low  or 0, ce_close or 0), min(sl, sc) or 1)
-    f3 = sd(max(pe_high or 0, pe_close or 0), min(sl, sc) or 1)
-    f4 = sd(min(pe_low  or 0, pe_close or 0), max(sh, sc))
-    f5 = sd(ce_ltp or 0, s)
-    f6 = sd(pe_ltp or 0, s)
+    f1 = sd(max(ce_h, ce_c), max(sh, sc))
+    f2 = sd(min(ce_lo, ce_c), min(sl, sc) or 1)
+    f3 = sd(max(pe_h, pe_c), min(sl, sc) or 1)
+    f4 = sd(min(pe_lo, pe_c), max(sh, sc))
+    f5 = sd(ce_l, s)
+    f6 = sd(pe_l, s)
     f7 = f1-f2; f8 = f3-f4; f9 = f7/2; f10 = f8/2
     ab = f5-f9; ac = f6-f10; f13 = f8-f7
 
@@ -60,22 +96,27 @@ def calc_loc_25(s, sc, sh, sl, so,
     f18=s+abs(ab)*s if ab<0 else(s-abs(ab)*s if ab>0 else s)
     f19=s-abs(ac)*s if ac<0 else(s+abs(ac)*s if ac>0 else s)
     f20=f17*1.001; f21=f17*0.999; f22=f20-f18; f23=f21-f19
-    f24=s+f22;    f25=s+f23
+    f24=s+f22; f25=s+f23
 
     zone=("CALL" if s>f17 and s>f18 and s>f19 else
           "PUT"  if s<f17 and s<f18 and s<f19 else "WAIT")
     chg=round(s-sc,2)
     r2=lambda x:round(x,2); r4=lambda x:round(x,4)
     return {
-        "ltp":r2(s),"cp":r2(sc),"change":chg,"pct":round(chg/sc*100,2) if sc else 0,
+        "ltp":r2(s),"cp":r2(sc),"change":chg,
+        "pct":round(chg/sc*100,2) if sc else 0,
         "bop":r2(f17),"cep":r2(f18),"pep":r2(f19),
         "ul":r2(f24),"ll":r2(f25),"ful":r2(f20),"fll":r2(f21),
-        "ful_diff":r2(f22),"fll_diff":r2(f23),"dsl":r4(f15),"dsp":r2(f16),
-        "call_move":r4(f7),"put_move":r4(f8),"call_cp":r4(f9),"put_cp":r4(f10),
-        "call_cp_diff":r4(ab),"put_cp_diff":r4(ac),"different":r4(f13),
+        "ful_diff":r2(f22),"fll_diff":r2(f23),
+        "dsl":r4(f15),"dsp":r2(f16),
+        "call_move":r4(f7),"put_move":r4(f8),
+        "call_cp":r4(f9),"put_cp":r4(f10),
+        "call_cp_diff":r4(ab),"put_cp_diff":r4(ac),
+        "different":r4(f13),
         "ceh_sh":r4(f1),"cel_sl":r4(f2),"peh_sl":r4(f3),"pel_sh":r4(f4),
         "c_ce_s":r4(f5),"c_pe_s":r4(f6),
-        "zone":zone,"direction":"UP" if chg>=0 else "DOWN","distance":r2(abs(s-f17)),
+        "zone":zone,"direction":"UP" if chg>=0 else "DOWN",
+        "distance":r2(abs(s-f17)),
     }
 
 
@@ -102,154 +143,205 @@ class LOCEngine:
     def update_spot(self, symbol:str, ltp:float, close:float,
                     high:float, low:float, ts:int, open_:float=0):
         st=self.symbols.get(symbol)
-        if not st: return
-        st.spot.ltp=ltp; st.spot.close=close or ltp
-        st.spot.high=high or ltp; st.spot.low=low or ltp
-        st.spot.open=open_ or ltp; st.spot.ts=ts
+        if not st or not ltp: return
+        st.spot.ltp  = ltp
+        st.spot.close= close or ltp
+        st.spot.high = high  or ltp
+        st.spot.low  = low   or ltp
+        st.spot.open = open_ or ltp
+        st.spot.ts   = ts
 
-        # Check if ATM changed → swap ITM-2 strikes
-        step=STRIKE_STEPS.get(symbol.upper(),50)
-        new_atm=round(round(ltp/step)*step,2)
+        # ATM shift detection — use debounce (only act if ATM actually changes)
+        step = STRIKE_STEPS.get(symbol.upper(), 50)
+        new_atm = round(round(ltp / step) * step, 2)
         if new_atm != st.last_atm:
-            st.last_atm=new_atm
-            ce_s,pe_s=get_itm2_strikes(ltp,symbol)
-            if ce_s!=st.ce_strike or pe_s!=st.pe_strike:
-                print(f"[LOC] {symbol} ATM→CE:{ce_s} PE:{pe_s}")
-                st.ce_strike=ce_s; st.pe_strike=pe_s
+            st.last_atm = new_atm
+            ce_s, pe_s = get_itm2_strikes(ltp, symbol)
+            if ce_s != st.ce_strike or pe_s != st.pe_strike:
+                st.ce_strike = ce_s
+                st.pe_strike = pe_s
+                print(f"[LOC] {symbol} ATM shift→{new_atm} CE:{ce_s} PE:{pe_s}")
                 self._load_from_chain(symbol)
                 asyncio.create_task(self._refresh_chain(symbol))
         self._recalc(symbol)
 
     def update_option_from_feed(self, symbol:str, opt_type:str,
                                  ltp:float, close:float, high:float, low:float):
+        """Real-time CE/PE price update from WS feed."""
         st=self.symbols.get(symbol)
         if not st: return
-        opt=st.ce if opt_type=="CE" else st.pe
-        if ltp:   opt.ltp=ltp
-        if close: opt.close=close
-        if high:  opt.high=max(opt.high,high) if opt.high else high
-        if low and low>0: opt.low=min(opt.low,low) if opt.low else low
+        opt = st.ce if opt_type=="CE" else st.pe
+        if ltp and ltp>0:
+            opt.ltp = ltp
+        if close and close>0:
+            opt.close = close
+        if high and high>0:
+            opt.high = max(opt.high, high) if opt.high else high
+        if low and low>0:
+            opt.low  = min(opt.low, low)   if opt.low  else low
         self._recalc(symbol)
 
     def update_chain(self, symbol:str, chain:dict):
+        """Called after fresh chain fetch. Extracts spot and sets ITM-2 strikes."""
         st=self.symbols.get(symbol)
-        if not st: return
-        st.option_chain=chain
+        if not st or not chain: return
+        st.option_chain = chain
 
-        # ── KEY FIX: Use spot_price from chain response ──────────
-        # The chain rows contain underlying_spot_price — use it to
-        # calculate ITM-2 even if WS spot hasn't arrived yet
-        if chain:
-            # Get spot price embedded in chain
-            chain_spot=0.0
-            for row in chain.values():
-                sp = row.get("_spot",0)
-                if sp:
-                    chain_spot=sp; break
+        # Extract underlying spot from chain rows
+        chain_spot = 0.0
+        for row in chain.values():
+            sp = row.get("_spot", 0)
+            if sp:
+                chain_spot = float(sp)
+                break
 
-            if chain_spot:
-                st.chain_spot=chain_spot
-                # Use chain spot to set initial strikes if WS hasn't arrived
-                effective_spot = st.spot.ltp or chain_spot
-                ce_s,pe_s=get_itm2_strikes(effective_spot, symbol)
-                st.ce_strike=ce_s; st.pe_strike=pe_s
-                st.last_atm=round(round(effective_spot/STRIKE_STEPS.get(symbol.upper(),50))*STRIKE_STEPS.get(symbol.upper(),50),2)
+        if chain_spot:
+            st.chain_spot = chain_spot
+            # Use WS spot if available, else chain spot
+            effective_spot = st.spot.ltp or chain_spot
+            ce_s, pe_s = get_itm2_strikes(effective_spot, symbol)
+            st.ce_strike = ce_s
+            st.pe_strike = pe_s
+            step = STRIKE_STEPS.get(symbol.upper(), 50)
+            st.last_atm  = round(round(effective_spot / step) * step, 2)
 
-                # Also set spot data from chain if WS hasn't arrived
-                if not st.spot.ltp:
-                    st.spot.ltp=chain_spot; st.spot.close=chain_spot
+            # Prime spot data from chain if WS hasn't arrived yet
+            if not st.spot.ltp:
+                st.spot.ltp   = chain_spot
+                st.spot.close = chain_spot
 
         self._load_from_chain(symbol)
 
     def _load_from_chain(self, symbol:str):
+        """Load CE/PE data from chain at the ITM-2 strikes."""
         st=self.symbols.get(symbol)
         if not st or not st.option_chain: return
         if not st.ce_strike:
-            # Can't load without strikes — will retry when spot arrives
-            print(f"[LOC] {symbol}: no strikes yet, deferring chain load")
+            print(f"[LOC] {symbol}: no strikes set, skipping chain load")
             return
 
-        ce_row=st.option_chain.get(st.ce_strike,{})
-        pe_row=st.option_chain.get(st.pe_strike,{})
+        ce_row = st.option_chain.get(st.ce_strike, {})
+        pe_row = st.option_chain.get(st.pe_strike, {})
+
+        if not ce_row or not pe_row:
+            # Strikes not in chain — find nearest available strikes
+            strikes = sorted(st.option_chain.keys())
+            if strikes:
+                nearest_ce = min(strikes, key=lambda s: abs(s - st.ce_strike))
+                nearest_pe = min(strikes, key=lambda s: abs(s - st.pe_strike))
+                if abs(nearest_ce - st.ce_strike) < 200:
+                    ce_row = st.option_chain.get(nearest_ce, {})
+                    if ce_row: st.ce_strike = nearest_ce
+                if abs(nearest_pe - st.pe_strike) < 200:
+                    pe_row = st.option_chain.get(nearest_pe, {})
+                    if pe_row: st.pe_strike = nearest_pe
 
         def _best(*vals):
             for v in vals:
                 try:
-                    fv=float(v)
-                    if fv!=0: return fv
+                    fv = float(v)
+                    if fv > 0: return fv
                 except: pass
             return 0.0
 
         if ce_row.get("CE"):
-            c=ce_row["CE"]
-            ce_ltp=_best(c.get("ltp",0),c.get("close",0))
-            st.ce.ltp=ce_ltp; st.ce.close=_best(c.get("close",0),ce_ltp)
-            st.ce.high=_best(c.get("high",0),ce_ltp)
-            st.ce.low =_best(c.get("low",0), ce_ltp)
-            st.ce.oi  =float(c.get("oi",0)); st.ce.iv=float(c.get("iv",0))
-            st.ce.instrument_key=c.get("key","")
+            c = ce_row["CE"]
+            ltp   = _best(c.get("ltp"), c.get("close"))
+            close = _best(c.get("close"), c.get("ltp"))
+            st.ce.ltp   = ltp
+            st.ce.close = close
+            st.ce.high  = _best(c.get("high"), ltp)
+            st.ce.low   = _best(c.get("low"),  ltp)
+            st.ce.oi    = float(c.get("oi") or 0)
+            st.ce.iv    = float(c.get("iv") or 0)
+            st.ce.instrument_key = c.get("key", "")
 
         if pe_row.get("PE"):
-            p=pe_row["PE"]
-            pe_ltp=_best(p.get("ltp",0),p.get("close",0))
-            st.pe.ltp=pe_ltp; st.pe.close=_best(p.get("close",0),pe_ltp)
-            st.pe.high=_best(p.get("high",0),pe_ltp)
-            st.pe.low =_best(p.get("low",0), pe_ltp)
-            st.pe.oi  =float(p.get("oi",0)); st.pe.iv=float(p.get("iv",0))
-            st.pe.instrument_key=p.get("key","")
+            p = pe_row["PE"]
+            ltp   = _best(p.get("ltp"), p.get("close"))
+            close = _best(p.get("close"), p.get("ltp"))
+            st.pe.ltp   = ltp
+            st.pe.close = close
+            st.pe.high  = _best(p.get("high"), ltp)
+            st.pe.low   = _best(p.get("low"),  ltp)
+            st.pe.oi    = float(p.get("oi") or 0)
+            st.pe.iv    = float(p.get("iv") or 0)
+            st.pe.instrument_key = p.get("key", "")
 
         print(f"[LOC] {symbol} loaded: "
-              f"CE@{st.ce_strike}=ltp:{st.ce.ltp} close:{st.ce.close} key:{st.ce.instrument_key[:25] if st.ce.instrument_key else 'MISSING'} | "
-              f"PE@{st.pe_strike}=ltp:{st.pe.ltp} close:{st.pe.close} key:{st.pe.instrument_key[:25] if st.pe.instrument_key else 'MISSING'}")
+              f"CE@{st.ce_strike}=ltp:{st.ce.ltp} close:{st.ce.close} "
+              f"eff:{st.ce.effective_ltp} "
+              f"key:{st.ce.instrument_key[:20] if st.ce.instrument_key else 'MISS'} | "
+              f"PE@{st.pe_strike}=ltp:{st.pe.ltp} close:{st.pe.close} "
+              f"eff:{st.pe.effective_ltp} "
+              f"key:{st.pe.instrument_key[:20] if st.pe.instrument_key else 'MISS'}")
         self._recalc(symbol)
 
     def _recalc(self, symbol:str):
-        st=self.symbols.get(symbol)
+        """Run all 25 LOC formulas and notify."""
+        st = self.symbols.get(symbol)
         if not st: return
-        # Use chain_spot as fallback if WS spot hasn't arrived
         spot_ltp = st.spot.ltp or st.chain_spot
         if not spot_ltp: return
 
-        res=calc_loc_25(
-            spot_ltp, st.spot.close or spot_ltp,
-            st.spot.high or spot_ltp, st.spot.low or spot_ltp, st.spot.open or spot_ltp,
-            st.ce.ltp, st.ce.close, st.ce.high, st.ce.low,
-            st.pe.ltp, st.pe.close, st.pe.high, st.pe.low,
+        # Use effective ltp (falls back to close when near 0)
+        res = calc_loc_25(
+            spot_ltp,
+            st.spot.close or spot_ltp,
+            st.spot.high  or spot_ltp,
+            st.spot.low   or spot_ltp,
+            st.spot.open  or spot_ltp,
+            st.ce.effective_ltp,  st.ce.close,
+            st.ce.effective_high, st.ce.effective_low,
+            st.pe.effective_ltp,  st.pe.close,
+            st.pe.effective_high, st.pe.effective_low,
         )
         res.update({
-            "symbol":symbol,"ce_strike":st.ce_strike,"pe_strike":st.pe_strike,
-            "expiry":st.expiry,
-            "ce_ltp":round(st.ce.ltp,2),"pe_ltp":round(st.pe.ltp,2),
-            "ce_iv":round(st.ce.iv,2),"pe_iv":round(st.pe.iv,2),
+            "symbol":symbol,
+            "ce_strike": st.ce_strike,
+            "pe_strike": st.pe_strike,
+            "expiry":    st.expiry,
+            "ce_ltp":    round(st.ce.effective_ltp, 2),
+            "pe_ltp":    round(st.pe.effective_ltp, 2),
+            "ce_close":  round(st.ce.close, 2),
+            "pe_close":  round(st.pe.close, 2),
+            "ce_high":   round(st.ce.effective_high, 2),
+            "ce_low":    round(st.ce.effective_low, 2),
+            "pe_high":   round(st.pe.effective_high, 2),
+            "pe_low":    round(st.pe.effective_low, 2),
+            "ce_iv":     round(st.ce.iv, 2),
+            "pe_iv":     round(st.pe.iv, 2),
         })
-        st.loc_result=res
+        st.loc_result = res
         if self.on_loc_update:
-            asyncio.create_task(self.on_loc_update(symbol,res))
+            asyncio.create_task(self.on_loc_update(symbol, res))
 
     def recalc(self, symbol:str):
         return self._recalc(symbol)
 
     async def _refresh_chain(self, symbol:str):
         if not self.access_token: return
-        st=self.symbols.get(symbol)
+        st = self.symbols.get(symbol)
         if not st or not st.expiry: return
-        cache_key=f"{symbol}|{st.expiry}"
-        if time.time()-self.chain_fetch_time.get(cache_key,0)<55: return
-        self.chain_fetch_time[cache_key]=time.time()
+        cache_key = f"{symbol}|{st.expiry}"
+        # Throttle: at most once per 55 seconds
+        if time.time() - self.chain_fetch_time.get(cache_key, 0) < 55: return
+        self.chain_fetch_time[cache_key] = time.time()
         from .instruments import fetch_option_chain
-        chain=await fetch_option_chain(symbol,st.expiry,self.access_token)
-        if chain: self.update_chain(symbol,chain)
+        chain = await fetch_option_chain(symbol, st.expiry, self.access_token)
+        if chain:
+            self.update_chain(symbol, chain)
 
     async def refresh_all_chains(self):
         for sym in list(self.symbols.keys()):
             await self._refresh_chain(sym)
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.3)
 
-    def get_all_results(self)->dict:
-        return {s:st.loc_result for s,st in self.symbols.items() if st.loc_result}
+    def get_all_results(self) -> dict:
+        return {s: st.loc_result for s, st in self.symbols.items() if st.loc_result}
 
-    def get_option_keys(self)->list:
-        keys=[]
+    def get_option_keys(self) -> list:
+        keys = []
         for st in self.symbols.values():
             if st.ce.instrument_key: keys.append(st.ce.instrument_key)
             if st.pe.instrument_key: keys.append(st.pe.instrument_key)
