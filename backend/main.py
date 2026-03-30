@@ -1,10 +1,13 @@
 """
-RAIMA Markets Dashboard v7
-Fixes:
-- Stocks update live (correct ISIN key routing)
-- CE/PE fetch via market-quote REST when chain ltp=0
-- Commodities section populates
-- Change% shows correctly
+RAIMA Markets v9 — Complete Fixed Backend
+Key fixes from screenshots (all 0.00 showing):
+1. /v3/market-quote/ohlc used for initial snapshot (not v2)
+2. MCX key validation at startup — finds working month
+3. WS subscription as TEXT frame (not bytes)
+4. Option chain close_price field correct
+5. Full OHLC (open,high,low,close) fetched for CE/PE via REST
+6. Intraday candle API v3 for chart data
+7. Proper broadcast — attaches display_name to every stock tick
 """
 import asyncio, inspect, json, os, time, struct as _struct
 from pathlib import Path
@@ -14,29 +17,32 @@ import httpx, websockets
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
 load_dotenv()
 USE_MOCK = os.getenv("MOCK_MODE","false").lower() in ("true","1","yes")
 
-app = FastAPI(title="RAIMA Markets v7")
+app = FastAPI(title="RAIMA Markets v9")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
                    allow_methods=["*"], allow_headers=["*"])
-static_dir = Path(__file__).parent.parent / "frontend" / "static"
-static_dir.mkdir(parents=True, exist_ok=True)
-app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
-API_KEY      = os.getenv("UPSTOX_API_KEY",    "8e11a453-2de7-4b87-9e02-986a0661d762")
-API_SECRET   = os.getenv("UPSTOX_API_SECRET", "fuy5zne695")
-REDIRECT_URI = os.getenv("UPSTOX_REDIRECT_URI","https://trading-dashboard-15ld.onrender.com/auth/callback")
-ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN","")
+FRONTEND_DIST   = Path(__file__).parent.parent / "frontend" / "dist"
+FRONTEND_STATIC = Path(__file__).parent.parent / "frontend" / "static"
+FRONTEND_STATIC.mkdir(parents=True, exist_ok=True)
+
+API_KEY      = os.getenv("UPSTOX_API_KEY", "")
+API_SECRET   = os.getenv("UPSTOX_API_SECRET", "")
+REDIRECT_URI = os.getenv("UPSTOX_REDIRECT_URI", "http://localhost:8000/auth/callback")
+ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", "")
 FEED_URL     = "wss://api.upstox.com/v3/feed/market-data-feed"
-PASSWORD     = os.getenv("DASHBOARD_PASSWORD","raima2024")
+PASSWORD     = os.getenv("DASHBOARD_PASSWORD", "raima2024")
 
 from .instruments import (
-    SPOT_KEYS, get_current_and_next_expiry, get_itm2_strikes,
-    fetch_expiry_list, fetch_option_chain, calculate_expiries_fallback
+    get_spot_keys, mcx_key, get_current_and_next_expiry, get_itm2_strikes,
+    fetch_expiry_list, fetch_option_chain, fetch_quotes_rest, fetch_index_quotes,
+    fetch_option_ohlc_rest, fetch_intraday_candles,
+    validate_mcx_keys, calculate_expiries_fallback, STRIKE_STEPS, MONTHLY_SYMBOLS
 )
 from .instrument_keys import NSE_EQ_KEYS, FO_STOCK_KEYS, ISIN_TO_SYMBOL
 from .loc_engine import LOCEngine
@@ -44,166 +50,139 @@ from .loc_engine import LOCEngine
 LOC_SYMBOLS = ["NIFTY","BANKNIFTY","FINNIFTY","MIDCPNIFTY","SENSEX",
                "CRUDEOIL","NATURALGAS","GOLD","SILVER"]
 
+# ── Dynamic instrument keys ────────────────────────────────────────
 INDEX_KEYS = [
     "NSE_INDEX|Nifty 50","NSE_INDEX|Nifty Bank","NSE_INDEX|Nifty Fin Service",
     "NSE_INDEX|NIFTY MID SELECT","NSE_INDEX|Nifty Next 50",
     "BSE_INDEX|SENSEX","BSE_INDEX|BANKEX",
 ]
 
-def _mcx_key(sym, months=0):
-    from datetime import date, timedelta
-    M=["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"]
-    d = date.today() + timedelta(days=30*months)
-    return f"MCX_FO|{sym}{str(d.year)[2:]}{M[d.month-1]}FUT"
+# Will be updated at startup after validate_mcx_keys()
+COMMODITY_KEYS = [mcx_key(s,0) for s in ["CRUDEOIL","NATURALGAS","GOLD","SILVER"]]
+SPOT_KEYS_D: dict = {}   # filled at startup
 
-# MCX commodity keys (current + next month)
-_MCX_SYMS = ["CRUDEOIL","NATURALGAS","GOLD","SILVER"]
-COMMODITY_KEYS = list(dict.fromkeys(
-    [_mcx_key(s) for s in _MCX_SYMS] + [_mcx_key(s,1) for s in _MCX_SYMS]
-))
-print(f"[MCX] Keys: {COMMODITY_KEYS[:4]}")
-
-# Build SPOT_KEYS_DYNAMIC with correct MCX month
-SPOT_KEYS_DYNAMIC = dict(SPOT_KEYS)
-for s in _MCX_SYMS:
-    SPOT_KEYS_DYNAMIC[s] = _mcx_key(s)
-
-# Reverse map: feed_key → symbol name
+# Feed key → LOC symbol (for routing to LOC engine)
 FEED_KEY_TO_SYM: dict = {}
-for sym, key in SPOT_KEYS_DYNAMIC.items():
-    FEED_KEY_TO_SYM[key] = sym
-# Also map next-month MCX
-for s in _MCX_SYMS:
-    FEED_KEY_TO_SYM[_mcx_key(s,1)] = s
-
-# ISIN reverse map for display: feed key → symbol
-ISIN_REVERSE = {v: k for k, v in NSE_EQ_KEYS.items()}
-
-# Option key → (symbol, CE/PE)
-option_key_map: dict = {}
+option_key_map:  dict = {}   # option_key → (symbol, "CE"/"PE")
 
 
 # ══════════════════════════════════════════════════════════════════
 #  PROTO DECODER
 # ══════════════════════════════════════════════════════════════════
-
 def _rv(b, p):
-    r=0; s=0
-    while p<len(b):
-        x=b[p]; p+=1; r|=(x&127)<<s
-        if not(x&128): break
-        s+=7
+    r = 0; s = 0
+    while p < len(b):
+        x = b[p]; p += 1; r |= (x & 127) << s
+        if not (x & 128): break
+        s += 7
     return r, p
 
-def _parse_ltpc(d):
-    o={}; i=0
-    while i<len(d):
-        t=d[i]; i+=1; fn=t>>3; wt=t&7
-        if wt==1 and i+8<=len(d):
-            v=_struct.unpack_from('<d',d,i)[0]; i+=8
-            if fn==1: o["ltp"]=round(v,2)
-            elif fn==4: o["cp"]=round(v,2)
-        elif wt==0:
-            v,i=_rv(d,i)
-            if fn==2: o["ltt"]=str(v)
-        elif wt==2: ln,i=_rv(d,i); i+=ln
-        elif wt==5 and i+4<=len(d): i+=4
+def _pe(d):
+    o = {}; i = 0
+    dm = {1:"atp",2:"cp",6:"uc",7:"lc",8:"high52",9:"low52",10:"ltp",11:"high",12:"low"}
+    while i < len(d):
+        t = d[i]; i += 1; fn = t>>3; wt = t&7
+        if wt == 1 and i+8 <= len(d):
+            v = _struct.unpack_from('<d',d,i)[0]; i += 8
+            if fn in dm: o[dm[fn]] = round(v,2)
+        elif wt == 0: _, i = _rv(d,i)
+        elif wt == 2: ln,i = _rv(d,i); i += ln
+        elif wt == 5 and i+4 <= len(d): i += 4
         else: break
     return o
 
-def _parse_efeed(d):
-    o={}; i=0
-    dm={1:"atp",2:"cp",6:"uc",7:"lc",8:"high52",9:"low52",10:"ltp",11:"high",12:"low"}
-    while i<len(d):
-        t=d[i]; i+=1; fn=t>>3; wt=t&7
-        if wt==1 and i+8<=len(d):
-            v=_struct.unpack_from('<d',d,i)[0]; i+=8
-            if fn in dm: o[dm[fn]]=round(v,2)
-        elif wt==0: _,i=_rv(d,i)
-        elif wt==2: ln,i=_rv(d,i); i+=ln
-        elif wt==5 and i+4<=len(d): i+=4
+def _pl(d):
+    o = {}; i = 0
+    while i < len(d):
+        t = d[i]; i += 1; fn = t>>3; wt = t&7
+        if wt == 1 and i+8 <= len(d):
+            v = _struct.unpack_from('<d',d,i)[0]; i += 8
+            if fn == 1: o["ltp"] = round(v,2)
+            elif fn == 4: o["cp"] = round(v,2)
+        elif wt == 0: _, i = _rv(d,i)
+        elif wt == 2: ln,i = _rv(d,i); i += ln
+        elif wt == 5 and i+4 <= len(d): i += 4
         else: break
     return o
 
-def _parse_mf(d):
-    o={}; i=0
-    while i<len(d):
-        t=d[i]; i+=1; fn=t>>3; wt=t&7
-        if wt==2:
-            ln,i=_rv(d,i); ch=d[i:i+ln]; i+=ln
-            if fn==1:
-                lt=_parse_ltpc(ch)
-                if lt and lt.get("ltp") and "ltpc" not in o: o["ltpc"]=lt
-            elif fn==2:
-                inn=_parse_mf(ch)
+def _pmf(d):
+    o = {}; i = 0
+    while i < len(d):
+        t = d[i]; i += 1; fn = t>>3; wt = t&7
+        if wt == 2:
+            ln,i = _rv(d,i); ch = d[i:i+ln]; i += ln
+            if fn == 1:
+                lt = _pl(ch)
+                if lt and lt.get("ltp") and "ltpc" not in o: o["ltpc"] = lt
+            elif fn == 2:
+                inn = _pmf(ch)
                 for k,v in inn.items():
-                    if k not in o: o[k]=v
-                    elif k=="ltpc" and isinstance(v,dict):
-                        for fk,fv in v.items():
-                            o["ltpc"].setdefault(fk,fv)
-            elif fn==4:
-                ef=_parse_efeed(ch)
+                    if k not in o: o[k] = v
+                    elif k == "ltpc" and isinstance(v,dict):
+                        [o["ltpc"].setdefault(fk,fv) for fk,fv in v.items()]
+            elif fn == 4:
+                ef = _pe(ch)
                 if ef:
-                    o["efeed"]=ef
-                    if "ltpc" not in o: o["ltpc"]={}
-                    lv=ef.get("ltp"); cv=ef.get("cp")
-                    if lv and lv!=0: o["ltpc"]["ltp"]=lv
-                    if cv and cv!=0 and "cp" not in o["ltpc"]: o["ltpc"]["cp"]=cv
-        elif wt==1 and i+8<=len(d): i+=8
-        elif wt==0: _,i=_rv(d,i)
-        elif wt==5 and i+4<=len(d): i+=4
+                    o["efeed"] = ef
+                    if "ltpc" not in o: o["ltpc"] = {}
+                    lv = ef.get("ltp"); cv = ef.get("cp")
+                    if lv and lv != 0: o["ltpc"]["ltp"] = lv
+                    if cv and cv != 0 and "cp" not in o["ltpc"]: o["ltpc"]["cp"] = cv
+        elif wt == 1 and i+8 <= len(d): i += 8
+        elif wt == 0: _, i = _rv(d,i)
+        elif wt == 5 and i+4 <= len(d): i += 4
         else: break
     return o
 
-def _parse_fd(d):
-    o={}; i=0
-    while i<len(d):
-        t=d[i]; i+=1; fn=t>>3; wt=t&7
-        if wt==2:
-            ln,i=_rv(d,i); ch=d[i:i+ln]; i+=ln
-            if fn==1: o["ltpc"]=_parse_ltpc(ch)
-            elif fn==2: o.update(_parse_mf(ch))
-        elif wt==0: _,i=_rv(d,i)
-        elif wt==1 and i+8<=len(d): i+=8
-        elif wt==5 and i+4<=len(d): i+=4
+def _pfd(d):
+    o = {}; i = 0
+    while i < len(d):
+        t = d[i]; i += 1; fn = t>>3; wt = t&7
+        if wt == 2:
+            ln,i = _rv(d,i); ch = d[i:i+ln]; i += ln
+            if fn == 1: o["ltpc"] = _pl(ch)
+            elif fn == 2: o.update(_pmf(ch))
+        elif wt == 0: _, i = _rv(d,i)
+        elif wt == 1 and i+8 <= len(d): i += 8
+        elif wt == 5 and i+4 <= len(d): i += 4
         else: break
     return o
 
-def _parse_me(d):
-    k=""; v={}; i=0
-    while i<len(d):
-        t=d[i]; i+=1; fn=t>>3; wt=t&7
-        if wt==2:
-            ln,i=_rv(d,i); ch=d[i:i+ln]; i+=ln
-            if fn==1: k=ch.decode("utf-8","replace")
-            elif fn==2: v=_parse_fd(ch)
-        elif wt==0: _,i=_rv(d,i)
-        elif wt==1 and i+8<=len(d): i+=8
-        elif wt==5 and i+4<=len(d): i+=4
+def _pme(d):
+    k = ""; v = {}; i = 0
+    while i < len(d):
+        t = d[i]; i += 1; fn = t>>3; wt = t&7
+        if wt == 2:
+            ln,i = _rv(d,i); ch = d[i:i+ln]; i += ln
+            if fn == 1: k = ch.decode("utf-8","replace")
+            elif fn == 2: v = _pfd(ch)
+        elif wt == 0: _, i = _rv(d,i)
+        elif wt == 1 and i+8 <= len(d): i += 8
+        elif wt == 5 and i+4 <= len(d): i += 4
         else: break
     return k,v
 
-def _parse_mi(d):
-    seg={}; i=0
-    ST={0:"CLOSED",1:"NORMAL_OPEN",2:"NORMAL_OPEN",3:"PREOPEN",4:"CLOSED"}
-    while i<len(d):
-        t=d[i]; i+=1; fn=t>>3; wt=t&7
-        if wt==2:
-            ln,i=_rv(d,i); ch=d[i:i+ln]; i+=ln
-            if fn==1:
+def _pmi(d):
+    seg = {}; i = 0
+    ST = {0:"CLOSED",1:"NORMAL_OPEN",2:"NORMAL_OPEN",3:"PREOPEN",4:"CLOSED"}
+    while i < len(d):
+        t = d[i]; i += 1; fn = t>>3; wt = t&7
+        if wt == 2:
+            ln,i = _rv(d,i); ch = d[i:i+ln]; i += ln
+            if fn == 1:
                 si=0; sn=""; sv=0
-                while si<len(ch):
-                    st=ch[si]; si+=1; sf=st>>3; sw=st&7
-                    if sw==2:
-                        sln,si=_rv(ch,si)
-                        if sf==1: sn=ch[si:si+sln].decode("utf-8","replace")
-                        si+=sln
-                    elif sw==0: sv,si=_rv(ch,si)
+                while si < len(ch):
+                    st = ch[si]; si += 1; sf = st>>3; sw = st&7
+                    if sw == 2:
+                        sln,si = _rv(ch,si)
+                        if sf == 1: sn = ch[si:si+sln].decode("utf-8","replace")
+                        si += sln
+                    elif sw == 0: sv,si = _rv(ch,si)
                     else: break
-                if sn: seg[sn]=ST.get(sv,"NORMAL_OPEN")
-        elif wt==0: _,i=_rv(d,i)
-        elif wt==1 and i+8<=len(d): i+=8
-        elif wt==5 and i+4<=len(d): i+=4
+                if sn: seg[sn] = ST.get(sv,"NORMAL_OPEN")
+        elif wt == 0: _, i = _rv(d,i)
+        elif wt == 1 and i+8 <= len(d): i += 8
+        elif wt == 5 and i+4 <= len(d): i += 4
         else: break
     return seg
 
@@ -211,285 +190,380 @@ def decode_v3(raw):
     try: return json.loads(raw.decode("utf-8"))
     except: pass
     try:
-        r={"type":"unknown","feeds":{},"currentTs":str(int(time.time()*1000))}
-        i=0; mt=0
-        while i<len(raw):
-            t=raw[i]; i+=1; fn=t>>3; wt=t&7
-            if wt==0:
-                v,i=_rv(raw,i)
-                if fn==1: mt=v
-                elif fn==3: r["currentTs"]=str(v)
-            elif wt==2:
-                ln,i=_rv(raw,i); ch=raw[i:i+ln]; i+=ln
-                if fn==2:
-                    k,v=_parse_me(ch)
-                    if k and v: r["feeds"][k]=v
-                elif fn==4:
-                    r["marketInfo"]={"segmentStatus":_parse_mi(ch)}
-            elif wt==1 and i+8<=len(raw): i+=8
-            elif wt==5 and i+4<=len(raw): i+=4
+        r = {"type":"unknown","feeds":{},"currentTs":str(int(time.time()*1000))}
+        i = 0; mt = 0
+        while i < len(raw):
+            t = raw[i]; i += 1; fn = t>>3; wt = t&7
+            if wt == 0:
+                v,i = _rv(raw,i)
+                if fn == 1: mt = v
+                elif fn == 3: r["currentTs"] = str(v)
+            elif wt == 2:
+                ln,i = _rv(raw,i); ch = raw[i:i+ln]; i += ln
+                if fn == 2:
+                    k,v = _pme(ch)
+                    if k and v: r["feeds"][k] = v
+                elif fn == 4: r["marketInfo"] = {"segmentStatus": _pmi(ch)}
+            elif wt == 1 and i+8 <= len(raw): i += 8
+            elif wt == 5 and i+4 <= len(raw): i += 4
             else: break
-        if mt==2 or r.get("marketInfo"): r["type"]="market_info"
-        elif mt==1 or r["feeds"]: r["type"]="live_feed"
+        if mt == 2 or r.get("marketInfo"): r["type"] = "market_info"
+        elif mt == 1 or r["feeds"]: r["type"] = "live_feed"
         return r if (r["feeds"] or r.get("marketInfo")) else None
     except: return None
 
-def extract_ltp_cp(fv: dict):
+def _ex(fv):
     ltpc=fv.get("ltpc",{}); ef=fv.get("efeed",{})
-    ltp = ltpc.get("ltp",0)
-    cp  = ltpc.get("cp",0) or ef.get("cp",0)
-    high = ef.get("high",0) or ltp
-    low  = ef.get("low",0)  or ltp
-    return ltp, cp, high, low
+    ltp = float(ltpc.get("ltp",0))
+    cp  = float(ltpc.get("cp",0) or ef.get("cp",0))
+    h   = float(ef.get("high",0) or ltp)
+    l   = float(ef.get("low",0)  or ltp)
+    o   = float(ef.get("open",0) or ltp)
+    return ltp, cp, o, h, l
 
 
 # ══════════════════════════════════════════════════════════════════
 #  APP STATE
 # ══════════════════════════════════════════════════════════════════
-
 class AppState:
-    access_token:  str = ACCESS_TOKEN
-    market_data:   dict = {}
+    access_token:  str  = ACCESS_TOKEN
+    market_data:   dict = {}   # feed_key → {ltpc,efeed,ts,display_name}
     market_status: dict = {}
-    ohlc_history:  dict = {}
+    ohlc:          dict = {}   # key → [{t,o,h,l,c,v}]
     loc_history:   dict = {}
-    loc_history_last: dict = {}
+    loc_hist_ts:   dict = {}
+    sessions:      dict = {}
+    expiry_cache:  dict = {}
+    prev_close:    dict = {}
     connected_clients: Set[WebSocket] = set()
     upstox_ws  = None
     feed_task  = None
     chain_task = None
     frame_count: int = 0
     decode_ok:   int = 0
-    sessions:    dict = {}
-    expiry_cache: dict = {}
     subscribed_option_keys: set = set()
-    # Track previous close for change% calculation
-    prev_close_cache: dict = {}
 
 state = AppState()
 loc_engine = LOCEngine()
 
-async def on_loc_updated(symbol: str, result: dict):
-    _record_loc_history(symbol, result)
-    spot_key = SPOT_KEYS_DYNAMIC.get(symbol,"")
-    await broadcast({"type":"loc_update","symbol":symbol,"spot_key":spot_key,"loc":result})
+async def _on_loc(symbol: str, result: dict):
+    _record_loc_hist(symbol, result)
+    await broadcast({"type":"loc_update","symbol":symbol,
+                     "spot_key":SPOT_KEYS_D.get(symbol,""),"loc":result})
 
-loc_engine.on_loc_update = on_loc_updated
+loc_engine.on_loc_update = _on_loc
 for sym in LOC_SYMBOLS:
     loc_engine.register(sym)
 
-def _update_ohlc(key, ltp, ts_ms):
+def _update_ohlc(key, ltp, ts_ms, o=0, h=0, l=0):
     if not ltp: return
-    minute=(int(ts_ms)//60000)*60000
-    hist=state.ohlc_history.setdefault(key,[])
-    if hist and hist[-1]["t"]==minute:
-        c=hist[-1]; c["h"]=max(c["h"],ltp); c["l"]=min(c["l"],ltp); c["c"]=ltp; c["v"]=c.get("v",0)+1
+    minute = (int(ts_ms)//60000)*60000
+    hist = state.ohlc.setdefault(key, [])
+    if hist and hist[-1]["t"] == minute:
+        c = hist[-1]
+        c["h"] = max(c["h"], h or ltp)
+        c["l"] = min(c["l"], l or ltp) if (l or ltp) else c["l"]
+        c["c"] = ltp; c["v"] = c.get("v",0)+1
     else:
-        hist.append({"t":minute,"o":ltp,"h":ltp,"l":ltp,"c":ltp,"v":1})
-        if len(hist)>390: hist.pop(0)
+        hist.append({"t":minute,"o":o or ltp,"h":h or ltp,"l":l or ltp,"c":ltp,"v":1})
+        if len(hist) > 400: hist.pop(0)
 
-def _record_loc_history(symbol, loc):
-    if not loc or loc.get("error"): return
-    now=int(time.time()//60)*60000
-    if state.loc_history_last.get(symbol)==now: return
-    state.loc_history_last[symbol]=now
-    hist=state.loc_history.setdefault(symbol,[])
-    keep=["ltp","bop","cep","pep","ul","ll","zone","change","direction",
-          "ce_strike","pe_strike","ce_ltp","pe_ltp","ce_iv","pe_iv"]
-    hist.insert(0,{"ts":int(time.time()*1000),**{k:loc[k] for k in keep if k in loc}})
-    if len(hist)>60: hist.pop()
+def _record_loc_hist(sym, loc):
+    if not loc: return
+    now = int(time.time()//60)*60000
+    if state.loc_hist_ts.get(sym) == now: return
+    state.loc_hist_ts[sym] = now
+    hist = state.loc_history.setdefault(sym, [])
+    keep = ["ltp","bop","cep","pep","ul","ll","zone","change","direction",
+            "ce_strike","pe_strike","ce_ltp","pe_ltp","ce_iv","pe_iv"]
+    hist.insert(0, {"ts":int(time.time()*1000), **{k:loc[k] for k in keep if k in loc}})
+    if len(hist) > 60: hist.pop()
 
-
-# ══════════════════════════════════════════════════════════════════
-#  REST API HELPERS
-# ══════════════════════════════════════════════════════════════════
-
-def _hdr(token: str) -> dict:
-    return {"Authorization":f"Bearer {token}","Accept":"application/json"}
-
-async def fetch_market_quote_batch(keys: list, token: str) -> dict:
-    """
-    GET /v2/market-quote/quotes for multiple instruments.
-    Returns {orig_key: {ltp, cp, high, low, open, volume}}
-    """
-    if not keys or not token: return {}
-    results = {}
-    for i in range(0, len(keys), 50):
-        chunk = keys[i:i+50]
-        try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                r = await client.get(
-                    "https://api.upstox.com/v2/market-quote/quotes",
-                    params={"instrument_key": ",".join(chunk)},
-                    headers=_hdr(token)
-                )
-                if r.status_code == 200:
-                    data = r.json().get("data",{})
-                    for resp_key, val in data.items():
-                        # resp_key like "NSE_EQ:INE002A01018" or "NSE_INDEX:Nifty 50"
-                        orig = resp_key.replace(":","|",1)
-                        ohlc = val.get("ohlc",{})
-                        ltp  = val.get("last_price",0) or ohlc.get("close",0)
-                        cp   = ohlc.get("close",0) or val.get("close",0)
-                        results[orig] = {
-                            "ltp": ltp, "cp": cp,
-                            "high": ohlc.get("high",ltp),
-                            "low":  ohlc.get("low",ltp),
-                            "open": ohlc.get("open",ltp),
-                            "volume": val.get("volume",0),
-                        }
-        except Exception as e:
-            print(f"[Quote] Error: {e}")
-        await asyncio.sleep(0.2)
-    return results
-
-async def fetch_ohlc_snapshot(keys: list, token: str) -> dict:
-    """
-    GET /v2/market-quote/ohlc (1d interval) for bulk price data.
-    Returns {orig_key: {ltpc:{ltp,cp}, efeed:{high,low,...}}}
-    """
-    if not keys or not token: return {}
-    results = {}
-    for i in range(0, len(keys), 50):
-        chunk = keys[i:i+50]
-        try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                r = await client.get(
-                    "https://api.upstox.com/v2/market-quote/ohlc",
-                    params={"instrument_key": ",".join(chunk), "interval":"1d"},
-                    headers=_hdr(token)
-                )
-                if r.status_code == 200:
-                    data = r.json().get("data",{})
-                    for resp_key, val in data.items():
-                        orig = resp_key.replace(":","|",1)
-                        ohlc = val.get("ohlc",{})
-                        ltp  = val.get("last_price",0) or ohlc.get("close",0)
-                        cp   = ohlc.get("close",0)
-                        # Store prev close for change% calculation
-                        state.prev_close_cache[orig] = cp
-                        results[orig] = {
-                            "ltpc":  {"ltp": ltp, "cp": cp},
-                            "efeed": {
-                                "high": ohlc.get("high",ltp),
-                                "low":  ohlc.get("low",ltp),
-                                "atp":  ltp, "cp": cp,
-                            },
-                        }
-                elif r.status_code == 429:
-                    print(f"[OHLC] Rate limited, waiting 2s...")
-                    await asyncio.sleep(2)
-                else:
-                    print(f"[OHLC] HTTP {r.status_code}: {r.text[:100]}")
-        except Exception as e:
-            print(f"[OHLC] Error: {e}")
-        await asyncio.sleep(0.3)
-    print(f"[OHLC] Loaded {len(results)} quotes")
-    return results
-
-async def fetch_option_quotes_by_keys(ce_key: str, pe_key: str, token: str) -> tuple:
-    """
-    Fetch CE and PE option prices directly via market-quote API.
-    Used as fallback when chain has ltp=0 (market closed / weekend).
-    Returns (ce_price, pe_price)
-    """
-    if not ce_key and not pe_key: return 0, 0
-    keys = [k for k in [ce_key, pe_key] if k]
-    quotes = await fetch_market_quote_batch(keys, token)
-    ce_price = quotes.get(ce_key, {}).get("ltp",0) or quotes.get(ce_key, {}).get("cp",0)
-    pe_price = quotes.get(pe_key, {}).get("ltp",0) or quotes.get(pe_key, {}).get("cp",0)
-    return ce_price, pe_price
+def _route_tick(key, ltp, cp, o, h, l, ts):
+    if not ltp: return
+    sym = FEED_KEY_TO_SYM.get(key)
+    if sym and sym in LOC_SYMBOLS:
+        loc_engine.update_spot(sym, ltp, cp, h, l, ts, o)
+        return
+    if key in option_key_map:
+        sym, opt_type = option_key_map[key]
+        loc_engine.update_option_from_feed(sym, opt_type, ltp, cp, h, l)
 
 
 # ══════════════════════════════════════════════════════════════════
-#  EXPIRY & CHAIN MANAGEMENT
+#  STARTUP INIT
 # ══════════════════════════════════════════════════════════════════
+async def startup_init():
+    global COMMODITY_KEYS, SPOT_KEYS_D, FEED_KEY_TO_SYM
 
-async def init_expiries():
-    print("[Expiry] Loading expiry lists...")
+    print("[Init] Starting data init...")
+
+    # Step 1: Validate MCX keys
+    if state.access_token:
+        print("[Init] Validating MCX keys...")
+        valid_mcx = await validate_mcx_keys(state.access_token)
+    else:
+        valid_mcx = {s: mcx_key(s,0) for s in ["CRUDEOIL","NATURALGAS","GOLD","SILVER"]}
+
+    # Step 2: Build SPOT_KEYS_D and COMMODITY_KEYS
+    SPOT_KEYS_D = dict(get_spot_keys())
+    for sym, key in valid_mcx.items():
+        SPOT_KEYS_D[sym] = key
+
+    COMMODITY_KEYS = list(dict.fromkeys(
+        [valid_mcx.get(s, mcx_key(s,0)) for s in ["CRUDEOIL","NATURALGAS","GOLD","SILVER"]] +
+        [mcx_key(s,1) for s in ["CRUDEOIL","NATURALGAS"]]
+    ))
+
+    # Step 3: Build reverse map
+    FEED_KEY_TO_SYM.clear()
+    for sym, key in SPOT_KEYS_D.items():
+        FEED_KEY_TO_SYM[key] = sym
+    for s in ["CRUDEOIL","NATURALGAS","GOLD","SILVER"]:
+        for m in [0,1,2]:
+            FEED_KEY_TO_SYM[mcx_key(s,m)] = s
+
+    print(f"[Init] Spot keys: {SPOT_KEYS_D}")
+    print(f"[Init] Commodity keys: {COMMODITY_KEYS}")
+
+    # Step 4: Fetch expiries
     for sym in LOC_SYMBOLS:
         try:
-            expiries = []
             if state.access_token:
                 expiries = await fetch_expiry_list(sym, state.access_token)
-            if not expiries:
+            else:
                 expiries = calculate_expiries_fallback(sym)
             info = get_current_and_next_expiry(expiries, sym)
             state.expiry_cache[sym] = info
             default = info.get("default")
             if default:
                 loc_engine.set_expiry(sym, default)
-                print(f"[Expiry] {sym} → {default}")
+                print(f"[Init] {sym} expiry={default}")
         except Exception as e:
-            print(f"[Expiry] {sym}: {e}")
+            print(f"[Init] {sym} expiry: {e}")
+
     await broadcast({"type":"expiry_update","expiry_cache":state.expiry_cache})
 
-async def init_market_snapshot():
-    """Fetch initial prices for all stocks and MCX via REST."""
-    if not state.access_token: return
-    print("[Snapshot] Fetching initial OHLC...")
-    all_keys = list(dict.fromkeys(FO_STOCK_KEYS + COMMODITY_KEYS[:4]))
-    data = await fetch_ohlc_snapshot(all_keys, state.access_token)
-    for key, val in data.items():
-        state.market_data[key] = {**val, "ts": str(int(time.time()*1000))}
-    print(f"[Snapshot] Loaded {len(data)} instruments")
-    # Push to all connected clients
-    await broadcast({"type":"snapshot_update","market_data":state.market_data})
+    # Step 5: Initial OHLC snapshot for stocks + indices
+    if state.access_token:
+        print("[Init] Fetching initial OHLC snapshot...")
+        # Stocks and commodities via /v3/ohlc
+        stock_comm_keys = list(dict.fromkeys(FO_STOCK_KEYS + COMMODITY_KEYS[:4]))
+        data = await fetch_quotes_rest(stock_comm_keys, state.access_token)
+        # Indices via /v2/market-quote/quotes
+        idx_data = await fetch_index_quotes(INDEX_KEYS, state.access_token)
+        data.update(idx_data)
+        for k, v in data.items():
+            sym_name = ISIN_TO_SYMBOL.get(k, "")
+            state.market_data[k] = {**v, "ts":str(int(time.time()*1000)),
+                                     "display_name":sym_name}
+            ltp = v.get("ltpc",{}).get("ltp",0)
+            cp  = v.get("ltpc",{}).get("cp",0)
+            if cp: state.prev_close[k] = cp
+            if ltp:
+                ef = v.get("efeed",{})
+                _update_ohlc(k, ltp, int(time.time()*1000),
+                             ef.get("open",ltp), ef.get("high",ltp), ef.get("low",ltp))
+        print(f"[Init] Snapshot loaded: {len(data)} instruments")
+        await broadcast({"type":"snapshot_update","market_data":state.market_data})
 
-async def refresh_ce_pe_prices():
-    """
-    After loading chain, fetch CE/PE prices via market-quote API.
-    This works even on weekends when chain ltp=0.
-    """
-    if not state.access_token: return
-    for sym, st in loc_engine.symbols.items():
-        if not st.ce.instrument_key and not st.pe.instrument_key: continue
-        ce_p, pe_p = await fetch_option_quotes_by_keys(
-            st.ce.instrument_key, st.pe.instrument_key, state.access_token
-        )
-        if ce_p or pe_p:
-            if ce_p:
-                st.ce.ltp   = ce_p if ce_p else st.ce.ltp
-                st.ce.close = st.ce.close or ce_p
-            if pe_p:
-                st.pe.ltp   = pe_p if pe_p else st.pe.ltp
-                st.pe.close = st.pe.close or pe_p
-            print(f"[Options] {sym} REST prices: CE={ce_p} PE={pe_p}")
-            loc_engine._recalc(sym)
-        await asyncio.sleep(0.2)
+    # Step 6: Fetch CE/PE OHLC from REST (since chain may have 0s)
+    if state.access_token:
+        await _refresh_all_option_ohlc()
 
-async def periodic_chain_refresh():
+
+async def _refresh_all_option_ohlc():
+    """Fetch full OHLC for all CE/PE options via REST."""
+    if not state.access_token: return
+    for sym in LOC_SYMBOLS:
+        st = loc_engine.get_state(sym)
+        if not st or not st.ce.instrument_key: continue
+        data = await fetch_option_ohlc_rest(
+            st.ce.instrument_key, st.pe.instrument_key, state.access_token)
+        if data:
+            ce_d = data.get(st.ce.instrument_key, {})
+            pe_d = data.get(st.pe.instrument_key, {})
+            if ce_d:
+                st.ce.ltp   = ce_d["ltp"]   or ce_d["close"] or st.ce.ltp
+                st.ce.close = ce_d["close"]  or st.ce.close
+                st.ce.high  = ce_d["high"]   or st.ce.high or st.ce.ltp
+                st.ce.low   = ce_d["low"]    or st.ce.low  or st.ce.ltp
+            if pe_d:
+                st.pe.ltp   = pe_d["ltp"]   or pe_d["close"] or st.pe.ltp
+                st.pe.close = pe_d["close"]  or st.pe.close
+                st.pe.high  = pe_d["high"]   or st.pe.high or st.pe.ltp
+                st.pe.low   = pe_d["low"]    or st.pe.low  or st.pe.ltp
+            if ce_d.get("ltp") or pe_d.get("ltp"):
+                print(f"[Init] {sym} opts CE={ce_d.get('ltp',0)} PE={pe_d.get('ltp',0)}")
+                loc_engine.recalc(sym)
+        await asyncio.sleep(0.15)
+
+
+async def _subscribe_new_option_keys():
+    if not state.upstox_ws: return
+    new_keys = [k for k in loc_engine.get_option_keys()
+                if k and k not in state.subscribed_option_keys]
+    if not new_keys: return
+    await _sub_text(state.upstox_ws, new_keys, "full")
+    state.subscribed_option_keys.update(new_keys)
+    for st in loc_engine.symbols.values():
+        if st.ce.instrument_key: option_key_map[st.ce.instrument_key] = (st.symbol,"CE")
+        if st.pe.instrument_key: option_key_map[st.pe.instrument_key] = (st.symbol,"PE")
+    print(f"[Options] Subscribed {len(new_keys)} option keys: {new_keys[:2]}")
+
+async def periodic_refresh():
     while True:
         await asyncio.sleep(60)
         if not state.access_token: continue
         await loc_engine.refresh_all_chains()
         await asyncio.sleep(1)
-        await refresh_ce_pe_prices()
-        await _subscribe_option_keys()
-
-async def _subscribe_option_keys():
-    if not state.upstox_ws: return
-    new_keys = [k for k in loc_engine.get_option_keys()
-                if k and k not in state.subscribed_option_keys]
-    if new_keys:
-        await _sub(state.upstox_ws, new_keys, "full")
-        state.subscribed_option_keys.update(new_keys)
-        for st in loc_engine.symbols.values():
-            if st.ce.instrument_key:
-                option_key_map[st.ce.instrument_key] = (st.symbol, "CE")
-            if st.pe.instrument_key:
-                option_key_map[st.pe.instrument_key] = (st.symbol, "PE")
-        print(f"[Options] Subscribed {len(new_keys)} option keys to feed")
+        await _refresh_all_option_ohlc()
+        await _subscribe_new_option_keys()
 
 
 # ══════════════════════════════════════════════════════════════════
-#  ROUTES
+#  WS SUBSCRIPTION — TEXT FRAME (not bytes!)
 # ══════════════════════════════════════════════════════════════════
+async def _sub_text(ws, keys: list, mode: str = "full"):
+    """Send subscription as JSON TEXT frame — Upstox v3 requirement."""
+    msg = json.dumps({
+        "guid": f"raima_{int(time.time()*1000)}",
+        "method": "sub",
+        "data": {"mode": mode, "instrumentKeys": keys},
+    })
+    await ws.send(msg)   # TEXT frame
 
-@app.get("/", response_class=HTMLResponse)
-async def root():
-    return (Path(__file__).parent.parent/"frontend"/"index.html").read_text(encoding="utf-8")
+def _ws_connect(url, headers):
+    sig = inspect.signature(websockets.connect); p = sig.parameters
+    kw  = dict(ping_interval=20, ping_timeout=10)
+    if "extra_headers" in p: kw["extra_headers"] = headers
+    else:                    kw["additional_headers"] = headers
+    return websockets.connect(url, **kw)
 
+
+# ══════════════════════════════════════════════════════════════════
+#  BROWSER WEBSOCKET
+# ══════════════════════════════════════════════════════════════════
+@app.websocket("/ws/feed")
+async def ws_browser(ws: WebSocket):
+    await ws.accept(); state.connected_clients.add(ws)
+    try:
+        await ws.send_text(json.dumps({
+            "type": "snapshot",
+            "market_data": state.market_data,
+            "market_status": state.market_status,
+            "loc_results": loc_engine.get_all_results(),
+            "expiry_cache": state.expiry_cache,
+            "spot_keys": SPOT_KEYS_D,
+            "commodity_keys": COMMODITY_KEYS,
+            "mode": "mock" if USE_MOCK else "live",
+        }))
+        while True:
+            await asyncio.sleep(15)
+            await ws.send_text(json.dumps({"type":"ping","ts":int(time.time()*1000)}))
+    except (WebSocketDisconnect, Exception): pass
+    finally: state.connected_clients.discard(ws)
+
+async def broadcast(msg: dict):
+    if msg.get("type") == "live_feed":
+        ts = int(msg.get("currentTs",0) or time.time()*1000)
+        for k, fv in msg.get("feeds",{}).items():
+            ltp, cp, o, h, l = _ex(fv)
+            if cp == 0 and k in state.prev_close:
+                cp = state.prev_close[k]
+                fv.setdefault("ltpc",{})["cp"] = cp
+            sym_name = ISIN_TO_SYMBOL.get(k,"")
+            if sym_name: fv["display_name"] = sym_name
+            state.market_data[k] = {**state.market_data.get(k,{}), **fv, "ts":str(ts)}
+            if ltp: _update_ohlc(k, ltp, ts, o, h, l)
+            _route_tick(k, ltp, cp, o, h, l, ts)
+        msg["loc_results"] = loc_engine.get_all_results()
+
+    elif msg.get("type") == "market_info":
+        si = msg.get("marketInfo",{}).get("segmentStatus",{})
+        if si: state.market_status = si
+
+    elif msg.get("type") in ("snapshot_update","expiry_update"):
+        for k, v in msg.get("market_data",{}).items():
+            if not state.market_data.get(k,{}).get("ltpc",{}).get("ltp"):
+                state.market_data[k] = v
+
+    if not state.connected_clients: return
+    text = json.dumps(msg); dead = set()
+    for ws in list(state.connected_clients):
+        try: await ws.send_text(text)
+        except: dead.add(ws)
+    state.connected_clients -= dead
+
+
+# ══════════════════════════════════════════════════════════════════
+#  UPSTOX LIVE FEED
+# ══════════════════════════════════════════════════════════════════
+async def start_feed():
+    if USE_MOCK:
+        from backend.mock_feed import start_mock_feed
+        await start_mock_feed(broadcast); return
+
+    headers = {"Authorization": f"Bearer {state.access_token}", "Accept": "*/*"}
+    while True:
+        try:
+            async with _ws_connect(FEED_URL, headers) as ws:
+                state.upstox_ws = ws
+                print("[Feed] ✓ Connected to Upstox V3 WebSocket")
+
+                # 1. Indices — full mode
+                await _sub_text(ws, INDEX_KEYS, "full")
+                await asyncio.sleep(0.5)
+
+                # 2. Commodities — full mode (both current & next month)
+                await _sub_text(ws, COMMODITY_KEYS, "full")
+                await asyncio.sleep(0.5)
+
+                # 3. F&O stocks (ISIN keys) — full mode for OHLC
+                stock_keys = list(dict.fromkeys(FO_STOCK_KEYS))
+                for i in range(0, len(stock_keys), 100):
+                    await _sub_text(ws, stock_keys[i:i+100], "full")
+                    await asyncio.sleep(0.3)
+
+                # 4. Option CE/PE keys from chain
+                opt_keys = loc_engine.get_option_keys()
+                if opt_keys:
+                    await _sub_text(ws, opt_keys, "full")
+                    state.subscribed_option_keys.update(opt_keys)
+                    for st_sym in loc_engine.symbols.values():
+                        if st_sym.ce.instrument_key:
+                            option_key_map[st_sym.ce.instrument_key] = (st_sym.symbol,"CE")
+                        if st_sym.pe.instrument_key:
+                            option_key_map[st_sym.pe.instrument_key] = (st_sym.symbol,"PE")
+
+                print(f"[Feed] Subscribed: {len(INDEX_KEYS)} idx | "
+                      f"{len(COMMODITY_KEYS)} mcx | {len(stock_keys)} stocks | "
+                      f"{len(opt_keys)} options")
+
+                tick_n = 0
+                async for raw in ws:
+                    state.frame_count += 1
+                    try:
+                        msg = (decode_v3(raw) if isinstance(raw,bytes)
+                               else (json.loads(raw) if raw else None))
+                        if msg and (msg.get("feeds") or msg.get("marketInfo")):
+                            state.decode_ok += 1
+                            await broadcast(msg)
+                            tick_n += 1
+                            if tick_n % 300 == 0:
+                                await _subscribe_new_option_keys()
+                    except Exception as ex:
+                        print(f"[Decode] {ex}")
+
+        except asyncio.CancelledError: break
+        except Exception as e: print(f"[Feed] Reconnect: {e}")
+        finally: state.upstox_ws = None
+        await asyncio.sleep(5)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  AUTH ROUTES
+# ══════════════════════════════════════════════════════════════════
 @app.post("/auth/login")
 async def login(payload: dict):
     if payload.get("password") == PASSWORD:
@@ -500,57 +574,64 @@ async def login(payload: dict):
 
 @app.get("/auth/upstox/login")
 async def upstox_login():
+    if not API_KEY: raise HTTPException(400,"API_KEY not set")
     params = {"client_id":API_KEY,"redirect_uri":REDIRECT_URI,"response_type":"code"}
     return RedirectResponse(f"https://api.upstox.com/v2/login/authorization/dialog?{urlencode(params)}")
 
 @app.get("/auth/callback")
-async def callback(code: str):
+async def auth_cb(code: str):
     async with httpx.AsyncClient() as c:
         r = await c.post("https://api.upstox.com/v2/login/authorization/token",
             data={"code":code,"client_id":API_KEY,"client_secret":API_SECRET,
                   "redirect_uri":REDIRECT_URI,"grant_type":"authorization_code"},
             headers={"Accept":"application/json"})
     d = r.json()
-    if "access_token" not in d: raise HTTPException(400, str(d))
+    if "access_token" not in d: raise HTTPException(400,str(d))
     state.access_token = d["access_token"]
     loc_engine.access_token = d["access_token"]
-    asyncio.create_task(_restart_all())
-    return RedirectResponse("/?auth=success")
+    asyncio.create_task(_restart()); return RedirectResponse("/?auth=success")
 
 @app.post("/auth/token")
 async def set_token(payload: dict):
     t = payload.get("access_token","")
     if not t: raise HTTPException(400,"access_token required")
-    state.access_token = t
-    loc_engine.access_token = t
-    asyncio.create_task(_restart_all())
-    return {"status":"ok","message":"Feed starting..."}
+    state.access_token = t; loc_engine.access_token = t
+    asyncio.create_task(_restart())
+    return {"status":"ok","message":"Feed restarting..."}
 
-async def _restart_all():
-    print("[Restart] Starting feed...")
+async def _restart():
+    print("[Restart] Restarting...")
     if state.feed_task and not state.feed_task.done():
-        state.feed_task.cancel()
-        await asyncio.sleep(1)
+        state.feed_task.cancel(); await asyncio.sleep(1)
     state.feed_task = asyncio.create_task(start_feed())
-    await asyncio.sleep(4)
-    await init_expiries()
-    await asyncio.sleep(1)
-    await init_market_snapshot()
-    await asyncio.sleep(2)
-    await refresh_ce_pe_prices()
-    if state.chain_task and not state.chain_task.done():
-        state.chain_task.cancel()
-    state.chain_task = asyncio.create_task(periodic_chain_refresh())
+    await asyncio.sleep(3)
+    await startup_init()
+    if state.chain_task and not state.chain_task.done(): state.chain_task.cancel()
+    state.chain_task = asyncio.create_task(periodic_refresh())
     print("[Restart] Done")
 
+
+# ══════════════════════════════════════════════════════════════════
+#  DATA API ROUTES
+# ══════════════════════════════════════════════════════════════════
+@app.get("/api/status")
+async def api_status():
+    return {
+        "auth": bool(state.access_token) or USE_MOCK,
+        "feed_connected": state.upstox_ws is not None,
+        "instruments": len(state.market_data), "frames": state.frame_count,
+        "decoded": state.decode_ok, "mode": "mock" if USE_MOCK else "live",
+        "option_keys": len(state.subscribed_option_keys),
+        "spot_keys": SPOT_KEYS_D, "commodity_keys": COMMODITY_KEYS,
+    }
+
 @app.get("/api/market-data")
-async def market_data():
+async def market_data_api():
     return {"market_data":state.market_data,"market_status":state.market_status,
-            "timestamp":int(time.time()*1000),"mode":"mock" if USE_MOCK else "live"}
+            "timestamp":int(time.time()*1000)}
 
 @app.get("/api/loc-all")
-async def loc_all():
-    return loc_engine.get_all_results()
+async def loc_all(): return loc_engine.get_all_results()
 
 @app.get("/api/loc/{symbol}")
 async def get_loc(symbol: str):
@@ -559,7 +640,7 @@ async def get_loc(symbol: str):
     return st.loc_result or {"error":"No data yet"}
 
 @app.get("/api/loc-history/{symbol}")
-async def loc_history(symbol: str):
+async def get_loc_history(symbol: str):
     return {"symbol":symbol,"history":state.loc_history.get(symbol.upper(),[])}
 
 @app.get("/api/expiry/{symbol}")
@@ -568,259 +649,123 @@ async def get_expiry(symbol: str):
 
 @app.post("/api/expiry/{symbol}")
 async def set_expiry(symbol: str, payload: dict):
-    expiry = payload.get("expiry",""); sym = symbol.upper()
-    if sym not in state.expiry_cache: state.expiry_cache[sym] = {}
-    state.expiry_cache[sym]["selected"] = expiry
+    sym    = symbol.upper(); expiry = payload.get("expiry","")
+    if not expiry: raise HTTPException(400,"expiry required")
     loc_engine.set_expiry(sym, expiry)
-    # Fetch chain and option prices for new expiry
-    asyncio.create_task(_refresh_expiry_chain(sym, expiry))
+    state.expiry_cache.setdefault(sym,{})["selected"] = expiry
+    asyncio.create_task(_refresh_chain_and_sub(sym, expiry))
     return {"status":"ok","symbol":sym,"expiry":expiry}
 
-async def _refresh_expiry_chain(sym: str, expiry: str):
+async def _refresh_chain_and_sub(sym: str, expiry: str):
     chain = await fetch_option_chain(sym, expiry, state.access_token)
-    if chain:
-        loc_engine.update_chain(sym, chain)
+    if chain: loc_engine.update_chain(sym, chain)
     await asyncio.sleep(0.5)
-    await refresh_ce_pe_prices()
-    await _subscribe_option_keys()
+    await _refresh_all_option_ohlc()
+    await _subscribe_new_option_keys()
 
-@app.get("/api/status")
-async def get_status():
-    return {
-        "auth": bool(state.access_token) or USE_MOCK,
-        "feed_connected": state.upstox_ws is not None,
-        "instruments": len(state.market_data),
-        "frames": state.frame_count,
-        "decoded": state.decode_ok,
-        "mode": "mock" if USE_MOCK else "live",
-        "option_keys": len(state.subscribed_option_keys),
-        "expiry_loaded": list(state.expiry_cache.keys()),
-    }
+@app.get("/api/ohlc/{key:path}")
+async def get_ohlc(key: str):
+    """Return server-tracked OHLC candles."""
+    return {"key":key,"candles":state.ohlc.get(key,[])}
+
+@app.get("/api/ohlc-live/{key:path}")
+async def get_ohlc_live(key: str, tf: str = "minutes/1"):
+    """Fetch intraday candles from Upstox API v3."""
+    if not state.access_token: return {"key":key,"candles":[]}
+    # Parse tf like "minutes/1", "hours/1", "days/1"
+    parts = tf.split("/")
+    unit = parts[0] if len(parts)>0 else "minutes"
+    interval = int(parts[1]) if len(parts)>1 else 1
+    candles = await fetch_intraday_candles(key, state.access_token, unit, interval)
+    return {"key":key,"candles":candles}
 
 @app.get("/api/debug/chain/{symbol}")
 async def debug_chain(symbol: str):
     st = loc_engine.get_state(symbol.upper())
     if not st: return {"error":"not registered"}
     return {
-        "symbol": symbol, "expiry": st.expiry,
-        "spot_ltp": st.spot.ltp, "last_atm": st.last_atm,
-        "ce_strike": st.ce_strike, "ce_ltp": st.ce.ltp,
-        "ce_close":  st.ce.close,  "ce_key": st.ce.instrument_key,
-        "pe_strike": st.pe_strike, "pe_ltp": st.pe.ltp,
-        "pe_close":  st.pe.close,  "pe_key": st.pe.instrument_key,
-        "chain_size": len(st.option_chain), "loc": st.loc_result,
+        "symbol":symbol,"expiry":st.expiry,"spot_ltp":st.spot.ltp,
+        "ce_strike":st.ce_strike,"ce_ltp":st.ce.ltp,"ce_close":st.ce.close,
+        "ce_high":st.ce.high,"ce_low":st.ce.low,"ce_key":st.ce.instrument_key,
+        "pe_strike":st.pe_strike,"pe_ltp":st.pe.ltp,"pe_close":st.pe.close,
+        "pe_high":st.pe.high,"pe_low":st.pe.low,"pe_key":st.pe.instrument_key,
+        "chain_size":len(st.option_chain),"loc":st.loc_result,
     }
 
-@app.get("/api/ohlc/{key:path}")
-async def get_ohlc(key: str):
-    return {"key":key,"candles":state.ohlc_history.get(key,[])}
+@app.get("/api/debug/mcx")
+async def debug_mcx():
+    return {"commodity_keys":COMMODITY_KEYS,"spot_keys":SPOT_KEYS_D}
 
 @app.post("/api/subscribe")
 async def subscribe(payload: dict):
-    keys = payload.get("instrumentKeys",[]); mode = payload.get("mode","full")
-    if state.upstox_ws and keys: await _sub(state.upstox_ws, keys, mode)
+    keys=payload.get("instrumentKeys",[]); mode=payload.get("mode","full")
+    if state.upstox_ws and keys: await _sub_text(state.upstox_ws, keys, mode)
     return {"status":"ok"}
 
-watchlists: dict = {}
+_watchlists: dict = {}
 
 @app.get("/api/watchlist")
-async def get_wl():
-    return watchlists
+async def get_wl(): return _watchlists
 
 @app.post("/api/watchlist")
 async def save_wl(p: dict):
-    n = p.get("name","default")
-    watchlists[n] = p.get("keys",[])
-    return {"status":"ok"}
+    _watchlists[p.get("name","default")] = p.get("keys",[]); return {"status":"ok"}
 
 @app.delete("/api/watchlist/{name}")
 async def del_wl(name: str):
-    watchlists.pop(name,None)
-    return {"status":"ok"}
+    _watchlists.pop(name,None); return {"status":"ok"}
 
 
-# ══════════════════════════════════════════════════════════════════
-#  BROWSER WEBSOCKET
-# ══════════════════════════════════════════════════════════════════
-
-@app.websocket("/ws/feed")
-async def ws_browser(ws: WebSocket):
-    await ws.accept(); state.connected_clients.add(ws)
+# ── Serve React build ─────────────────────────────────────────────
+if FRONTEND_DIST.exists():
     try:
-        await ws.send_text(json.dumps({
-            "type":"snapshot",
-            "market_data": state.market_data,
-            "market_status": state.market_status,
-            "loc_results": loc_engine.get_all_results(),
-            "expiry_cache": state.expiry_cache,
-            "mode": "mock" if USE_MOCK else "live",
-        }))
-        while True:
-            await asyncio.sleep(20)
-            await ws.send_text(json.dumps({"type":"ping","ts":int(time.time()*1000)}))
-    except (WebSocketDisconnect, Exception): pass
-    finally: state.connected_clients.discard(ws)
+        app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIST/"assets")),name="assets")
+    except: pass
 
-async def broadcast(msg: dict):
-    # Update server-side state
-    if msg.get("type") == "live_feed":
-        for k, v in msg.get("feeds",{}).items():
-            ltp, cp, high, low = extract_ltp_cp(v)
-            ts = int(msg.get("currentTs",0) or time.time()*1000)
-            # Preserve prev_close from snapshot if feed doesn't provide it
-            if cp == 0 and k in state.prev_close_cache:
-                cp = state.prev_close_cache[k]
-                if "ltpc" in v: v["ltpc"]["cp"] = cp
-            state.market_data[k] = {**state.market_data.get(k,{}), **v, "ts":str(ts)}
-            if ltp: _update_ohlc(k, ltp, ts)
-            _route_to_loc(k, ltp, cp, high, low, ts)
-    elif msg.get("type") == "market_info":
-        si = msg.get("marketInfo",{}).get("segmentStatus",{})
-        if si: state.market_status = si
-    elif msg.get("type") == "snapshot_update":
-        # REST snapshot arrived — merge with existing data
-        for k, v in msg.get("market_data",{}).items():
-            if k not in state.market_data:
-                state.market_data[k] = v
-            else:
-                # Only update if feed hasn't already updated this key
-                existing = state.market_data[k]
-                if existing.get("ltpc",{}).get("ltp",0) == 0:
-                    state.market_data[k] = {**existing, **v}
+@app.get("/")
+async def root():
+    idx = FRONTEND_DIST/"index.html"
+    if idx.exists(): return FileResponse(str(idx))
+    return HTMLResponse("<h2>Build frontend: cd frontend && npm run build</h2>")
 
-    if not state.connected_clients: return
-    t = json.dumps(msg); dead = set()
-    for ws in list(state.connected_clients):
-        try: await ws.send_text(t)
-        except: dead.add(ws)
-    state.connected_clients -= dead
+@app.get("/{path:path}")
+async def spa(path: str):
+    f = FRONTEND_DIST/path
+    if f.exists() and f.is_file(): return FileResponse(str(f))
+    idx = FRONTEND_DIST/"index.html"
+    if idx.exists(): return FileResponse(str(idx))
+    return HTMLResponse("Not found",404)
 
 
 # ══════════════════════════════════════════════════════════════════
-#  LOC ENGINE ROUTING
+#  STARTUP
 # ══════════════════════════════════════════════════════════════════
-
-def _route_to_loc(key: str, ltp: float, cp: float, high: float, low: float, ts: int):
-    if not ltp: return
-    # Is it a spot index/commodity?
-    sym = FEED_KEY_TO_SYM.get(key)
-    if sym and sym in LOC_SYMBOLS:
-        loc_engine.update_spot(symbol=sym, ltp=ltp, close=cp, high=high, low=low, ts=ts)
-        return
-    # Is it an option?
-    if key in option_key_map:
-        sym, opt_type = option_key_map[key]
-        loc_engine.update_option_from_feed(
-            symbol=sym, opt_type=opt_type,
-            ltp=ltp, close=cp, high=high, low=low
-        )
-
-
-# ══════════════════════════════════════════════════════════════════
-#  UPSTOX LIVE FEED
-# ══════════════════════════════════════════════════════════════════
-
-def _sub_msg(keys, mode):
-    return json.dumps({"guid":f"d{int(time.time())}","method":"sub",
-                        "data":{"mode":mode,"instrumentKeys":keys}}).encode()
-
-async def _sub(ws, keys, mode="full"):
-    await ws.send(_sub_msg(keys, mode))
-
-def _ws_connect(url, headers):
-    sig = inspect.signature(websockets.connect); p = sig.parameters
-    kw = dict(ping_interval=20, ping_timeout=10)
-    if "extra_headers" in p: kw["extra_headers"] = headers
-    else: kw["additional_headers"] = headers
-    return websockets.connect(url, **kw)
-
-async def start_feed():
-    if USE_MOCK:
-        from backend.mock_feed import start_mock_feed
-        await start_mock_feed(broadcast)
-        return
-    headers = {"Authorization":f"Bearer {state.access_token}","Accept":"*/*"}
-    while True:
-        try:
-            async with _ws_connect(FEED_URL, headers) as ws:
-                state.upstox_ws = ws
-                print("[Feed] ✓ Connected to Upstox V3")
-
-                # 1. Indices (full mode for OHLC+efeed)
-                await _sub(ws, INDEX_KEYS, "full")
-                await asyncio.sleep(0.3)
-
-                # 2. MCX commodities (full mode)
-                await _sub(ws, COMMODITY_KEYS[:4], "full")
-                await asyncio.sleep(0.3)
-
-                # 3. F&O stocks with ISIN keys (full mode for live OHLC)
-                stock_keys = list(dict.fromkeys(FO_STOCK_KEYS))
-                for i in range(0, len(stock_keys), 100):
-                    await _sub(ws, stock_keys[i:i+100], "full")
-                    await asyncio.sleep(0.2)
-
-                # 4. Option keys (if already known from chain)
-                opt_keys = loc_engine.get_option_keys()
-                if opt_keys:
-                    await _sub(ws, opt_keys, "full")
-                    state.subscribed_option_keys.update(opt_keys)
-                    for st in loc_engine.symbols.values():
-                        if st.ce.instrument_key:
-                            option_key_map[st.ce.instrument_key] = (st.symbol,"CE")
-                        if st.pe.instrument_key:
-                            option_key_map[st.pe.instrument_key] = (st.symbol,"PE")
-
-                print(f"[Feed] Subscribed: {len(INDEX_KEYS)} idx + {len(COMMODITY_KEYS[:4])} mcx "
-                      f"+ {len(stock_keys)} stocks + {len(opt_keys)} options")
-
-                tick_count = 0
-                async for raw in ws:
-                    state.frame_count += 1
-                    is_bin = isinstance(raw, bytes)
-                    msg = decode_v3(raw) if is_bin else (json.loads(raw) if raw else None)
-                    if msg and (msg.get("feeds") or msg.get("marketInfo")):
-                        state.decode_ok += 1
-                        await broadcast(msg)
-                        tick_count += 1
-                        # Periodically subscribe any new option keys
-                        if tick_count % 200 == 0:
-                            await _subscribe_option_keys()
-
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            print(f"[Feed] Error: {e}")
-        finally:
-            state.upstox_ws = None
-        await asyncio.sleep(5)
-
-
 @app.on_event("startup")
-async def startup():
-    print(f"  RAIMA Markets v7  |  {'MOCK' if USE_MOCK else 'LIVE'}  |  ws={websockets.__version__}")
+async def on_startup():
+    print(f"RAIMA Markets v9 | {'MOCK' if USE_MOCK else 'LIVE'} | ws={websockets.__version__}")
+    # Build initial key maps even without token
+    global SPOT_KEYS_D, FEED_KEY_TO_SYM
+    SPOT_KEYS_D = get_spot_keys()
+    FEED_KEY_TO_SYM = {v:k for k,v in SPOT_KEYS_D.items()}
+    for s in ["CRUDEOIL","NATURALGAS","GOLD","SILVER"]:
+        for m in [0,1,2]: FEED_KEY_TO_SYM[mcx_key(s,m)] = s
+
     if USE_MOCK:
         from backend.mock_feed import start_mock_feed
         state.feed_task = asyncio.create_task(start_mock_feed(broadcast))
-        asyncio.create_task(_delayed_init())
     elif state.access_token:
         loc_engine.access_token = state.access_token
         state.feed_task = asyncio.create_task(start_feed())
-        asyncio.create_task(_delayed_init())
     else:
-        print("[!] No token — POST /auth/token")
-        asyncio.create_task(_delayed_init())
+        print("[!] No token — POST /auth/token or set UPSTOX_ACCESS_TOKEN in .env")
 
-async def _delayed_init():
+    asyncio.create_task(_delayed_startup())
+
+async def _delayed_startup():
     await asyncio.sleep(3)
-    await init_expiries()
-    if state.access_token:
-        await asyncio.sleep(1)
-        await init_market_snapshot()
-        await asyncio.sleep(2)
-        await refresh_ce_pe_prices()
-    state.chain_task = asyncio.create_task(periodic_chain_refresh())
+    await startup_init()
+    state.chain_task = asyncio.create_task(periodic_refresh())
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("backend.main:app", host="0.0.0.0", port=8000, reload=True)

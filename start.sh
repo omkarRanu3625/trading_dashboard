@@ -1,37 +1,18 @@
-#!/usr/bin/env bash
-# ── Local development only ──
-# Render uses render.yaml startCommand directly, NOT this script
-
-set -e
+#!/bin/bash
+echo "RAIMA Markets v5"
 cd "$(dirname "$0")"
+source .venv/bin/activate 2>/dev/null || source .venv/Scripts/activate 2>/dev/null || true
 
-echo "=================================================="
-echo "  Trading Dashboard  -  Local Dev"
-echo "=================================================="
+# Check if .env exists
+if [ ! -f .env ]; then cp .env.example .env 2>/dev/null || true; fi
 
-# Create venv if needed
-if [ ! -d ".venv" ]; then
-  echo "Creating virtual environment..."
-  python -m venv .venv 2>/dev/null || python3 -m venv .venv
-fi
-
-# Activate (Windows or Unix)
-if [ -f ".venv/Scripts/activate" ]; then
-  source .venv/Scripts/activate
-elif [ -f ".venv/bin/activate" ]; then
-  source .venv/bin/activate
-fi
-
-pip install -q -r requirements.txt
-
-# Check credentials
-if grep -q "your_api_key_here" .env 2>/dev/null || [ ! -f ".env" ]; then
-  echo "No credentials → MOCK mode"
-  export MOCK_MODE=true
-else
+# Detect mode
+if grep -q "UPSTOX_ACCESS_TOKEN=." .env 2>/dev/null && ! grep -q "MOCK_MODE=true" .env; then
   echo "Credentials found → LIVE mode"
-  export MOCK_MODE=false
+else
+  echo "No token → MOCK mode"
+  export MOCK_MODE=true
 fi
 
-echo "Starting at http://localhost:8000"
+echo "Starting backend at http://localhost:8000"
 uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
