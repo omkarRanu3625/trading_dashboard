@@ -248,8 +248,14 @@ loc_engine = LOCEngine()
 
 async def _on_loc(symbol: str, result: dict):
     _record_loc_hist(symbol, result)
-    await broadcast({"type":"loc_update","symbol":symbol,
-                     "spot_key":SPOT_KEYS_D.get(symbol,""),"loc":result})
+    # Include spot_key so frontend can link index card to LOC
+    spot_key = SPOT_KEYS_D.get(symbol, "")
+    await broadcast({
+        "type": "loc_update",
+        "symbol": symbol,
+        "spot_key": spot_key,
+        "loc": result,
+    })
 
 loc_engine.on_loc_update = _on_loc
 for sym in LOC_SYMBOLS:
@@ -469,14 +475,33 @@ async def broadcast(msg: dict):
         ts = int(msg.get("currentTs",0) or time.time()*1000)
         for k, fv in msg.get("feeds",{}).items():
             ltp, cp, o, h, l = _ex(fv)
+            # Restore prev_close if feed omits it
             if cp == 0 and k in state.prev_close:
                 cp = state.prev_close[k]
                 fv.setdefault("ltpc",{})["cp"] = cp
+            # Merge efeed: preserve day open/high/low from REST snapshot
+            existing = state.market_data.get(k, {})
+            prev_ef = existing.get("efeed", {})
+            new_ef  = fv.get("efeed", {})
+            # Only update high/low if live value is valid (non-zero)
+            merged_ef = {**prev_ef, **new_ef}
+            if not merged_ef.get("open") or merged_ef["open"]==0: merged_ef["open"] = prev_ef.get("open",ltp)
+            if not merged_ef.get("high") or merged_ef["high"]==0: merged_ef["high"] = prev_ef.get("high",ltp)
+            if not merged_ef.get("low")  or merged_ef["low"] ==0: merged_ef["low"]  = prev_ef.get("low",ltp)
+            merged_ef["ltp"] = ltp
+            merged_ef["cp"]  = cp
+            fv["efeed"] = merged_ef
             sym_name = ISIN_TO_SYMBOL.get(k,"")
             if sym_name: fv["display_name"] = sym_name
-            state.market_data[k] = {**state.market_data.get(k,{}), **fv, "ts":str(ts)}
-            if ltp: _update_ohlc(k, ltp, ts, o, h, l)
-            _route_tick(k, ltp, cp, o, h, l, ts)
+            state.market_data[k] = {**existing, **fv, "ts":str(ts)}
+            if ltp: _update_ohlc(k, ltp, ts,
+                                  merged_ef.get("open",ltp),
+                                  merged_ef.get("high",ltp),
+                                  merged_ef.get("low",ltp))
+            _route_tick(k, ltp, cp,
+                        merged_ef.get("open",ltp),
+                        merged_ef.get("high",ltp),
+                        merged_ef.get("low",ltp), ts)
         msg["loc_results"] = loc_engine.get_all_results()
 
     elif msg.get("type") == "market_info":
@@ -676,6 +701,70 @@ async def get_ohlc_live(key: str, tf: str = "minutes/1"):
     parts = tf.split("/")
     unit = parts[0] if len(parts)>0 else "minutes"
     interval = int(parts[1]) if len(parts)>1 else 1
+    candles = await fetch_intraday_candles(key, state.access_token, unit, interval)
+    return {"key":key,"candles":candles}
+
+@app.get("/api/ohlc-hist/{key:path}")
+async def get_ohlc_hist(key: str, unit: str = "minutes", interval: int = 1,
+                         to_date: str = "", from_date: str = ""):
+    """
+    Fetch historical candles via /v3/historical-candle/{key}/{unit}/{interval}/{to}/{from}
+    Supports 1m/5m/15m/1h/1d with configurable date range.
+    """
+    if not state.access_token: return {"key":key,"candles":[]}
+    from .instruments import fetch_intraday_candles
+    import httpx
+    from datetime import date
+
+    if not to_date:
+        to_date = date.today().isoformat()
+    if not from_date:
+        # default: 5 days back
+        from datetime import timedelta
+        from_date = (date.today()-timedelta(days=5)).isoformat()
+
+    # For today's intraday, use intraday endpoint
+    today = date.today().isoformat()
+    if from_date == today and to_date == today and unit != "days":
+        candles = await fetch_intraday_candles(key, state.access_token, unit, interval)
+        return {"key":key,"candles":candles}
+
+    # Historical endpoint
+    try:
+        encoded = key.replace("|", "%7C")
+        url = f"https://api.upstox.com/v3/historical-candle/{encoded}/{unit}/{interval}/{to_date}/{from_date}"
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.get(url, headers={"Authorization":f"Bearer {state.access_token}","Accept":"application/json"})
+            if r.status_code == 200:
+                raw_candles = (r.json() or {}).get("data",{})
+                if raw_candles is None: return {"key":key,"candles":[]}
+                candles_raw = (raw_candles or {}).get("candles",[]) or []
+                from datetime import datetime
+                result = []
+                for candle in candles_raw:
+                    if len(candle) < 5: continue
+                    try:
+                        ts = int(datetime.fromisoformat(str(candle[0])).timestamp()*1000)
+                    except:
+                        ts = 0
+                    if ts:
+                        result.append({
+                            "t":ts,"o":float(candle[1] or 0),"h":float(candle[2] or 0),
+                            "l":float(candle[3] or 0),"c":float(candle[4] or 0),
+                            "v":int(candle[5]) if len(candle)>5 else 0,
+                        })
+                # Also merge with intraday for today
+                if to_date == today:
+                    today_candles = await fetch_intraday_candles(key, state.access_token, unit, interval)
+                    existing_times = {c["t"] for c in result}
+                    result += [c for c in today_candles if c["t"] not in existing_times]
+                result.sort(key=lambda c: c["t"])
+                return {"key":key,"candles":result}
+            else:
+                print(f"[Hist] {key} HTTP {r.status_code}: {r.text[:100]}")
+    except Exception as e:
+        print(f"[Hist] {key}: {e}")
+    # Fallback to intraday
     candles = await fetch_intraday_candles(key, state.access_token, unit, interval)
     return {"key":key,"candles":candles}
 

@@ -1,57 +1,120 @@
 import{create}from'zustand'
+
 const useStore=create((set,get)=>({
-  // Auth
   authed:!!sessionStorage.getItem("raima_auth"),
-  setAuthed:(v)=>{if(v)sessionStorage.setItem("raima_auth","1");else sessionStorage.removeItem("raima_auth");set({authed:v})},
-  // Connection
-  wsState:"CONNECTING",setWsState:(v)=>set({wsState:v}),
-  mode:"live",setMode:(v)=>set({mode:v}),
-  frames:0,tickCount:0,
-  // Market data
-  marketData:{},  // key → {ltpc,efeed,ts,...}
+  setAuthed:(v)=>{
+    if(v)sessionStorage.setItem("raima_auth","1")
+    else sessionStorage.removeItem("raima_auth")
+    set({authed:v})
+  },
+
+  wsState:"CONNECTING", setWsState:(v)=>set({wsState:v}),
+  mode:"live",          setMode:  (v)=>set({mode:v}),
+  frames:0, tickCount:0, instrCount:0,
+
+  marketData:{},
   marketStatus:{},
-  locResults:{},  // sym → loc result
-  expiryCache:{}, // sym → {all,default,...}
-  symCe:{},       // sym → {ltp,close,high,low,strike,iv}
-  symPe:{},       // sym → {ltp,close,high,low,strike,iv}
-  locHistory:{},  // sym → [{ts,ltp,bop,...}]
-  ohlcCache:{},   // key → candles[]
+  locResults:{},
+  expiryCache:{},
+  locHistory:{},
   watchlists:{},
-  symCe:{},
-  symPe:{},
+  commodityKeys:[],
+  spotKeys:{},
 
-  onSnapshot:(d)=>set({
-    marketData:{...d.market_data||{}},
-    marketStatus:d.market_status||{},
-    locResults:{...d.loc_results||{}},
-    expiryCache:d.expiry_cache||{},
-    symCe:d.sym_ce||{},symPe:d.sym_pe||{},
-    mode:d.mode||"live",
-    symCe:d.sym_ce||{},
-    symPe:d.sym_pe||{},
-  }),
+  // Full snapshot on connect
+  onSnapshot:(d)=>{
+    const md = d.market_data || {}
+    set({
+      marketData:   {...md},
+      marketStatus: d.market_status || {},
+      locResults:   {...(d.loc_results || {})},
+      expiryCache:  d.expiry_cache   || {},
+      commodityKeys:d.commodity_keys || [],
+      spotKeys:     d.spot_keys      || {},
+      mode:         d.mode           || "live",
+      instrCount:   Object.keys(md).length,
+    })
+  },
 
+  // Live feed tick — FORCE new object references so React re-renders
   onLiveFeed:(msg)=>set(s=>{
-    const md={...s.marketData}
-    for(const[k,v] of Object.entries(msg.feeds||{})){md[k]={...md[k],...v,ts:msg.currentTs}}
-    return{marketData:md,locResults:{...s.locResults,...(msg.loc_results||{})},
-      frames:s.frames+1,tickCount:s.tickCount+(Object.keys(msg.feeds||{}).length)}
+    const feeds = msg.feeds || {}
+    if(!Object.keys(feeds).length) return {}   // nothing changed
+
+    // Build completely new marketData object
+    const md = Object.assign({}, s.marketData)
+
+    for(const [k,v] of Object.entries(feeds)){
+      const prev = md[k] || {}
+      const prevLtpc = prev.ltpc || {}
+      const prevEf   = prev.efeed || {}
+      const newLtpc  = v.ltpc  || {}
+      const newEf    = v.efeed || {}
+
+      // ALWAYS preserve cp (prev close) — feed often doesn't send it
+      const ltp = newLtpc.ltp || 0
+      const cp  = newLtpc.cp  || prevLtpc.cp || prevEf.cp || 0
+
+      // Merge efeed: keep REST snapshot day OHLC, update with live values
+      const mergedEf = {
+        ...prevEf,
+        ...newEf,
+        ltp,
+        cp,
+        // Only update open/high/low if new value is valid (>0)
+        open: (newEf.open  > 0 ? newEf.open  : prevEf.open)  || ltp,
+        high: (newEf.high  > 0 ? newEf.high  : prevEf.high)  || ltp,
+        low:  (newEf.low   > 0 ? newEf.low   : prevEf.low)   || ltp,
+      }
+
+      // New object for this instrument — forces React to see change
+      md[k] = {
+        ...prev,
+        ...v,
+        ltpc:  { ...newLtpc, ltp, cp },
+        efeed: mergedEf,
+        display_name: v.display_name || prev.display_name || "",
+        ts:    msg.currentTs || Date.now(),
+      }
+    }
+
+    return {
+      marketData: md,
+      locResults: Object.keys(msg.loc_results || {}).length
+                    ? { ...s.locResults, ...msg.loc_results }
+                    : s.locResults,
+      frames:    s.frames + 1,
+      tickCount: s.tickCount + Object.keys(feeds).length,
+      instrCount:Object.keys(md).length,
+    }
   }),
 
-  onMarketInfo:(msg)=>set({marketStatus:msg.marketInfo?.segmentStatus||{}}),
+  // Individual LOC update — pushed on every recalc
+  onLiveLoc:(msg)=>set(s=>({
+    locResults:{ ...s.locResults, [msg.symbol]: msg.loc },
+  })),
+
+  onMarketInfo:(msg)=>set({
+    marketStatus: msg.marketInfo?.segmentStatus || {},
+  }),
 
   setLocHistory:(sym,hist)=>set(s=>({locHistory:{...s.locHistory,[sym]:hist}})),
-  setOhlc:(key,candles)=>set(s=>({ohlcCache:{...s.ohlcCache,[key]:candles}})),
   setWatchlists:(wl)=>set({watchlists:wl}),
   addWatchlist:(name)=>set(s=>({watchlists:{...s.watchlists,[name]:[]}})),
   addToWatchlist:(name,key)=>set(s=>{
-    const wl={...s.watchlists};wl[name]=[...(wl[name]||[])].filter(k=>k!==key).concat(key);return{watchlists:wl}
+    const wl={...s.watchlists}
+    wl[name]=[...(wl[name]||[])].filter(k=>k!==key).concat(key)
+    return{watchlists:wl}
   }),
   removeFromWatchlist:(name,key)=>set(s=>{
-    const wl={...s.watchlists};wl[name]=(wl[name]||[]).filter(k=>k!==key);return{watchlists:wl}
+    const wl={...s.watchlists}
+    wl[name]=(wl[name]||[]).filter(k=>k!==key)
+    return{watchlists:wl}
   }),
-  deleteWatchlist:(name)=>set(s=>{const wl={...s.watchlists};delete wl[name];return{watchlists:wl}}),
+  deleteWatchlist:(name)=>set(s=>{
+    const wl={...s.watchlists}
+    delete wl[name]
+    return{watchlists:wl}
+  }),
 }))
 export default useStore
-
-// Expose symCe/symPe getters as part of snapshot
