@@ -6,7 +6,11 @@ export default defineConfig({
     allowedHosts: true,
     proxy: {
       '/api': 'http://localhost:8000',
-      '/ws': { target: 'ws://localhost:8000', ws: true },
+      '/ws/feed': {
+        target: 'http://localhost:8000',
+        ws: true,
+        changeOrigin: true,
+      },
       '/auth': 'http://localhost:8000',
     }
   },

@@ -27,6 +27,9 @@ MONTHLY_SYMBOLS = {"GOLD","SILVER","COPPER"}
 _M = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"]
 
 def mcx_key(sym: str, months_ahead: int = 0) -> str:
+    """Generate MCX key. Uses instrument master if loaded, else name-based fallback."""
+    if _mcx_sym_to_key:
+        return _resolve_mcx_key(sym, months_ahead)
     d = date.today() + timedelta(days=30 * months_ahead)
     return f"MCX_FO|{sym.upper()}{str(d.year)[2:]}{_M[d.month-1]}FUT"
 
@@ -216,7 +219,7 @@ async def fetch_quotes_rest(keys: list, token: str) -> dict:
                     for resp_key, val in data.items():
                         if val is None: continue
                         try:
-                            norm = resp_key.replace(":", "|", 1)
+                            norm = normalize_mcx_response_key(resp_key.replace(":", "|", 1))
                             ltp  = float(val.get("last_price") or 0)
                             # v3 has live_ohlc and prev_ohlc
                             live = val.get("live_ohlc") or {}
@@ -248,7 +251,7 @@ async def fetch_quotes_rest(keys: list, token: str) -> dict:
                         data2 = (r2.json() or {}).get("data") or {}
                         for resp_key, val in data2.items():
                             if not val: continue
-                            norm = resp_key.replace(":", "|", 1)
+                            norm = normalize_mcx_response_key(resp_key.replace(":", "|", 1))
                             ohlc = val.get("ohlc") or {}
                             ltp  = float(val.get("last_price") or ohlc.get("close") or 0)
                             cp   = float(ohlc.get("close") or 0)
@@ -330,32 +333,143 @@ async def fetch_option_ohlc_rest(ce_key: str, pe_key: str, token: str) -> dict:
     return result
 
 
+_MCX_INSTRUMENT_MASTER_URL = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
+
+# Cache: tradingsymbol → instrument_key (e.g. "CRUDEOIL26APRFUT" → "MCX_FO|486502")
+_mcx_sym_to_key: dict = {}
+# Reverse: name-based key → numeric key (e.g. "MCX_FO|CRUDEOIL26APRFUT" → "MCX_FO|486502")
+_mcx_name_to_numeric: dict = {}
+# NSE_EQ tradingsymbol → instrument_key (e.g. "RELIANCE" → "NSE_EQ|INE002A01018")
+_nse_eq_sym_to_key: dict = {}
+
+
+async def _load_mcx_instrument_master():
+    """Download Upstox instrument master and build MCX futures + NSE_EQ lookups."""
+    global _mcx_sym_to_key, _nse_eq_sym_to_key
+    if _mcx_sym_to_key:
+        return  # already loaded
+    try:
+        import gzip
+        async with httpx.AsyncClient(timeout=30, verify=False) as c:
+            r = await c.get(_MCX_INSTRUMENT_MASTER_URL)
+            if r.status_code != 200:
+                print(f"[MCX] Instrument master HTTP {r.status_code}")
+                return
+            data = gzip.decompress(r.content).decode("utf-8")
+            lines = data.split("\n")
+            nse_count = 0
+            for line in lines[1:]:
+                cols = line.split(",")
+                if len(cols) < 12:
+                    continue
+                exchange = cols[11].strip('"')
+                inst_key = cols[0].strip('"')
+                trading_sym = cols[2].strip('"')
+                if exchange == "MCX_FO":
+                    if "FUT" in trading_sym:
+                        _mcx_sym_to_key[trading_sym] = inst_key
+                        _mcx_name_to_numeric[f"MCX_FO|{trading_sym}"] = inst_key
+                elif exchange == "NSE_EQ":
+                    _nse_eq_sym_to_key[trading_sym] = inst_key
+                    nse_count += 1
+        print(f"[MCX] Instrument master loaded: {len(_mcx_sym_to_key)} MCX futures, {nse_count} NSE_EQ")
+    except Exception as e:
+        print(f"[MCX] Instrument master error: {e}")
+
+
+def refresh_nse_eq_keys():
+    """Update NSE_EQ_KEYS and derived maps from the instrument master."""
+    if not _nse_eq_sym_to_key:
+        return
+    from . import instrument_keys
+    updated = 0
+    for sym in list(instrument_keys.NSE_EQ_KEYS.keys()):
+        master_key = _nse_eq_sym_to_key.get(sym)
+        if master_key and master_key != instrument_keys.NSE_EQ_KEYS[sym]:
+            instrument_keys.NSE_EQ_KEYS[sym] = master_key
+            updated += 1
+    if updated:
+        # Rebuild derived maps
+        instrument_keys.ISIN_TO_SYMBOL = {v: k for k, v in instrument_keys.NSE_EQ_KEYS.items()}
+        instrument_keys.FO_STOCK_KEYS = list(dict.fromkeys(instrument_keys.NSE_EQ_KEYS.values()))
+        print(f"[Init] Updated {updated} NSE_EQ keys from instrument master")
+
+
+def normalize_mcx_response_key(key: str) -> str:
+    """Convert name-based MCX key from API response to numeric instrument_key.
+    e.g. 'MCX_FO|CRUDEOIL26APRFUT' → 'MCX_FO|486502'
+    Returns original key if no mapping found.
+    """
+    if key.startswith("MCX_FO|") and not key.split("|")[1][:1].isdigit():
+        return _mcx_name_to_numeric.get(key, key)
+    return key
+
+
+def _resolve_mcx_key(sym: str, months_ahead: int) -> str:
+    """Resolve a commodity symbol to its correct Upstox instrument_key."""
+    d = date.today() + timedelta(days=30 * months_ahead)
+    trading_sym = f"{sym.upper()}{str(d.year)[2:]}{_M[d.month - 1]}FUT"
+    # Try exact match first
+    if trading_sym in _mcx_sym_to_key:
+        return _mcx_sym_to_key[trading_sym]
+    # Fallback: return name-based key (won't work but won't crash)
+    return f"MCX_FO|{trading_sym}"
+
+
 async def validate_mcx_keys(token: str) -> dict:
-    """Find which MCX month actually has data."""
+    """Find correct MCX instrument keys from the instrument master."""
+    await _load_mcx_instrument_master()
+
     result = {}
-    for sym in ["CRUDEOIL","NATURALGAS","GOLD","SILVER"]:
+    today = date.today()
+    for sym in ["CRUDEOIL", "NATURALGAS", "GOLD", "SILVER"]:
         found = False
-        for months in [0, 1, 2]:
-            key = mcx_key(sym, months)
-            try:
-                async with httpx.AsyncClient(timeout=8) as c:
-                    r = await c.get(UPSTOX_QUOTE_V2, params={"instrument_key": key}, headers=_h(token))
-                    if r.status_code == 200:
-                        data = (r.json() or {}).get("data") or {}
-                        # Check if any key in response matches (colon vs pipe format)
-                        matched = any(
-                            key.split("|")[-1] in k
-                            for k in data.keys()
-                        )
-                        if matched and data:
-                            result[sym] = key
-                            print(f"[MCX] {sym} → {key} ✓")
-                            found = True; break
-            except Exception as e:
-                print(f"[MCX] {sym} {key}: {e}")
+        # Search instrument master for nearest unexpired futures
+        candidates = []
+        for tsym, ikey in _mcx_sym_to_key.items():
+            if tsym.startswith(sym) and tsym.endswith("FUT"):
+                # Skip mini/micro variants
+                suffix = tsym[len(sym):]
+                if suffix[0:1] == "M" and suffix[1:2].isdigit():
+                    # e.g. CRUDEOILM26APRFUT — skip mini
+                    continue
+                if any(v in tsym for v in ["PETAL", "GUINEA", "TEN", "MIC"]):
+                    continue
+                candidates.append((tsym, ikey))
+
+        if candidates:
+            # Sort by expiry proximity — parse month/year from trading symbol
+            def _parse_expiry(tsym):
+                s = tsym[len(sym):]  # e.g. "26APRFUT"
+                try:
+                    yr = int("20" + s[:2])
+                    mon = _M.index(s[2:5]) + 1
+                    return date(yr, mon, 1)
+                except:
+                    return date(2099, 1, 1)
+
+            candidates.sort(key=lambda x: _parse_expiry(x[0]))
+            # Pick the nearest future that hasn't expired
+            for tsym, ikey in candidates:
+                exp_approx = _parse_expiry(tsym)
+                if exp_approx >= today.replace(day=1):
+                    result[sym] = ikey
+                    print(f"[MCX] {sym} = {ikey} ({tsym})")
+                    found = True
+                    break
+
         if not found:
-            result[sym] = mcx_key(sym, 1)  # default next month
-            print(f"[MCX] {sym} → next month fallback {result[sym]}")
+            # Absolute fallback: try months_ahead 0, 1, 2
+            for m in [0, 1, 2]:
+                key = _resolve_mcx_key(sym, m)
+                if key.startswith("MCX_FO|") and not key.split("|")[1][0].isdigit():
+                    continue  # name-based fallback, skip
+                result[sym] = key
+                found = True
+                break
+            if not found:
+                result[sym] = _resolve_mcx_key(sym, 1)
+                print(f"[MCX] {sym} → fallback {result[sym]}")
     return result
 
 
