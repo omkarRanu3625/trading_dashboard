@@ -117,14 +117,30 @@ export const SPOT_META = {
 // MCX keys (dynamic month — check startsWith)
 const MCX_SYM = {CRUDEOIL:"🛢",NATURALGAS:"🔥",GOLD:"🥇",SILVER:"🪙"}
 
+// Reverse lookup: numeric MCX key → symbol name (built from spotKeys)
+let _mcxKeyToSym = {}
+export const setMcxKeyMap = (spotKeys) => {
+  _mcxKeyToSym = {}
+  for (const [sym, ikey] of Object.entries(spotKeys||{})) {
+    if (ikey && ikey.startsWith("MCX_FO|")) _mcxKeyToSym[ikey] = sym
+  }
+}
+
 export const getMeta = (key, data) => {
   if (SPOT_META[key]) return SPOT_META[key]
   // MCX commodity
   if (key.startsWith("MCX_FO|")) {
+    // 1. Try reverse lookup from spotKeys (handles numeric keys like MCX_FO|486502)
+    const mapped = _mcxKeyToSym[key]
+    if (mapped && MCX_SYM[mapped]) return {n:mapped, s:mapped, ico:MCX_SYM[mapped], cat:"commodity"}
+    // 2. Try matching symbol name inside key (handles name-based keys)
     for (const [sym, ico] of Object.entries(MCX_SYM)) {
       if (key.includes(sym)) return {n:sym, s:sym, ico, cat:"commodity"}
     }
-    return {n:key.split("|")[1]?.substring(0,10)||key, s:"", ico:"⚙", cat:"commodity"}
+    // 3. Try display_name from data
+    const dn = data?.display_name
+    if (dn && MCX_SYM[dn]) return {n:dn, s:dn, ico:MCX_SYM[dn], cat:"commodity"}
+    return {n:dn||key.split("|")[1]?.substring(0,10)||key, s:"", ico:"⚙", cat:"commodity"}
   }
   // NSE EQ stock (ISIN key)
   if (key.startsWith("NSE_EQ|")) {

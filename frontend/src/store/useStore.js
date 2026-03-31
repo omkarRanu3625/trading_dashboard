@@ -1,4 +1,5 @@
 import{create}from'zustand'
+import{setMcxKeyMap}from'../utils'
 
 const useStore=create((set,get)=>({
   authed:!!sessionStorage.getItem("raima_auth"),
@@ -24,13 +25,15 @@ const useStore=create((set,get)=>({
   // Full snapshot on connect
   onSnapshot:(d)=>{
     const md = d.market_data || {}
+    const sk = d.spot_keys || {}
+    if(Object.keys(sk).length) setMcxKeyMap(sk)
     set({
       marketData:   {...md},
       marketStatus: d.market_status || {},
       locResults:   {...(d.loc_results || {})},
       expiryCache:  d.expiry_cache   || {},
       commodityKeys:d.commodity_keys || [],
-      spotKeys:     d.spot_keys      || {},
+      spotKeys:     sk,
       mode:         d.mode           || "live",
       instrCount:   Object.keys(md).length,
     })

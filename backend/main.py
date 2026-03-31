@@ -42,9 +42,11 @@ from .instruments import (
     get_spot_keys, mcx_key, get_current_and_next_expiry, get_itm2_strikes,
     fetch_expiry_list, fetch_option_chain, fetch_quotes_rest, fetch_index_quotes,
     fetch_option_ohlc_rest, fetch_intraday_candles,
-    validate_mcx_keys, calculate_expiries_fallback, STRIKE_STEPS, MONTHLY_SYMBOLS
+    validate_mcx_keys, calculate_expiries_fallback, normalize_mcx_response_key,
+    refresh_nse_eq_keys, STRIKE_STEPS, MONTHLY_SYMBOLS
 )
-from .instrument_keys import NSE_EQ_KEYS, FO_STOCK_KEYS, ISIN_TO_SYMBOL
+from . import instrument_keys as _ik
+from .instrument_keys import NSE_EQ_KEYS
 from .loc_engine import LOCEngine
 
 LOC_SYMBOLS = ["NIFTY","BANKNIFTY","FINNIFTY","MIDCPNIFTY","SENSEX",
@@ -321,13 +323,19 @@ async def startup_init():
         [mcx_key(s,1) for s in ["CRUDEOIL","NATURALGAS"]]
     ))
 
-    # Step 3: Build reverse map
+    # Step 3: Refresh NSE_EQ keys from instrument master (fixes stale ISINs)
+    refresh_nse_eq_keys()
+
+    # Step 4: Build reverse map
     FEED_KEY_TO_SYM.clear()
     for sym, key in SPOT_KEYS_D.items():
         FEED_KEY_TO_SYM[key] = sym
     for s in ["CRUDEOIL","NATURALGAS","GOLD","SILVER"]:
         for m in [0,1,2]:
             FEED_KEY_TO_SYM[mcx_key(s,m)] = s
+    # Also map updated NSE_EQ keys
+    for sym, key in _ik.NSE_EQ_KEYS.items():
+        FEED_KEY_TO_SYM[key] = sym
 
     print(f"[Init] Spot keys: {SPOT_KEYS_D}")
     print(f"[Init] Commodity keys: {COMMODITY_KEYS}")
@@ -354,13 +362,13 @@ async def startup_init():
     if state.access_token:
         print("[Init] Fetching initial OHLC snapshot...")
         # Stocks and commodities via /v3/ohlc
-        stock_comm_keys = list(dict.fromkeys(FO_STOCK_KEYS + COMMODITY_KEYS[:4]))
+        stock_comm_keys = list(dict.fromkeys(_ik.FO_STOCK_KEYS + COMMODITY_KEYS[:4]))
         data = await fetch_quotes_rest(stock_comm_keys, state.access_token)
         # Indices via /v2/market-quote/quotes
         idx_data = await fetch_index_quotes(INDEX_KEYS, state.access_token)
         data.update(idx_data)
         for k, v in data.items():
-            sym_name = ISIN_TO_SYMBOL.get(k, "")
+            sym_name = _ik.ISIN_TO_SYMBOL.get(k, "")
             state.market_data[k] = {**v, "ts":str(int(time.time()*1000)),
                                      "display_name":sym_name}
             ltp = v.get("ltpc",{}).get("ltp",0)
@@ -371,9 +379,26 @@ async def startup_init():
                 _update_ohlc(k, ltp, int(time.time()*1000),
                              ef.get("open",ltp), ef.get("high",ltp), ef.get("low",ltp))
         print(f"[Init] Snapshot loaded: {len(data)} instruments")
-        await broadcast({"type":"snapshot_update","market_data":state.market_data})
+        await broadcast({
+            "type":"snapshot_update",
+            "market_data":state.market_data,
+            "commodity_keys":COMMODITY_KEYS,
+            "spot_keys":SPOT_KEYS_D,
+            "expiry_cache":state.expiry_cache,
+            "loc_results":loc_engine.get_all_results(),
+            "market_status":state.market_status,
+        })
 
-    # Step 6: Fetch CE/PE OHLC from REST (since chain may have 0s)
+    # Step 6: Re-subscribe Upstox feed to validated commodity keys
+    # (start_feed() subscribed to stale module-level keys before validation)
+    if state.upstox_ws and COMMODITY_KEYS:
+        try:
+            await _sub_text(state.upstox_ws, COMMODITY_KEYS, "full")
+            print(f"[Init] Re-subscribed MCX keys: {COMMODITY_KEYS}")
+        except Exception as e:
+            print(f"[Init] MCX re-sub error: {e}")
+
+    # Step 7: Fetch CE/PE OHLC from REST (since chain may have 0s)
     if state.access_token:
         await _refresh_all_option_ohlc()
 
@@ -473,7 +498,13 @@ async def ws_browser(ws: WebSocket):
 async def broadcast(msg: dict):
     if msg.get("type") == "live_feed":
         ts = int(msg.get("currentTs",0) or time.time()*1000)
-        for k, fv in msg.get("feeds",{}).items():
+        # Normalize MCX keys: name-based → numeric (if instrument master loaded)
+        raw_feeds = msg.get("feeds", {})
+        feeds = {}
+        for k, fv in raw_feeds.items():
+            feeds[normalize_mcx_response_key(k)] = fv
+        msg["feeds"] = feeds
+        for k, fv in feeds.items():
             ltp, cp, o, h, l = _ex(fv)
             # Restore prev_close if feed omits it
             if cp == 0 and k in state.prev_close:
@@ -491,7 +522,7 @@ async def broadcast(msg: dict):
             merged_ef["ltp"] = ltp
             merged_ef["cp"]  = cp
             fv["efeed"] = merged_ef
-            sym_name = ISIN_TO_SYMBOL.get(k,"")
+            sym_name = _ik.ISIN_TO_SYMBOL.get(k,"")
             if sym_name: fv["display_name"] = sym_name
             state.market_data[k] = {**existing, **fv, "ts":str(ts)}
             if ltp: _update_ohlc(k, ltp, ts,
@@ -545,7 +576,7 @@ async def start_feed():
                 await asyncio.sleep(0.5)
 
                 # 3. F&O stocks (ISIN keys) — full mode for OHLC
-                stock_keys = list(dict.fromkeys(FO_STOCK_KEYS))
+                stock_keys = list(dict.fromkeys(_ik.FO_STOCK_KEYS))
                 for i in range(0, len(stock_keys), 100):
                     await _sub_text(ws, stock_keys[i:i+100], "full")
                     await asyncio.sleep(0.3)
@@ -710,7 +741,29 @@ async def get_ohlc_hist(key: str, unit: str = "minutes", interval: int = 1,
     """
     Fetch historical candles via /v3/historical-candle/{key}/{unit}/{interval}/{to}/{from}
     Supports 1m/5m/15m/1h/1d with configurable date range.
+    Frontend sends: /api/ohlc-hist/{instrKey}/{unit}/{interval}/{toDate}/{fromDate}
+    FastAPI {key:path} captures everything, so parse the extra segments here.
     """
+    # Parse path segments: key may contain unit/interval/dates appended by frontend
+    parts = key.split("/")
+    # The instrument key contains "|" (e.g. NSE_INDEX|Nifty 50) — find where extra segments start
+    # Extra segments are: unit (minutes|hours|days), interval (int), toDate, fromDate
+    _units = {"minutes", "hours", "days"}
+    split_idx = None
+    for i, p in enumerate(parts):
+        if p in _units and i > 0:
+            split_idx = i
+            break
+    if split_idx is not None:
+        key = "/".join(parts[:split_idx])
+        remaining = parts[split_idx:]
+        if len(remaining) >= 1: unit = remaining[0]
+        if len(remaining) >= 2:
+            try: interval = int(remaining[1])
+            except: pass
+        if len(remaining) >= 3: to_date = remaining[2]
+        if len(remaining) >= 4: from_date = remaining[3]
+
     if not state.access_token: return {"key":key,"candles":[]}
     from .instruments import fetch_intraday_candles
     import httpx
