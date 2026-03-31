@@ -1,7 +1,7 @@
 import{useState,useEffect,useRef,useCallback}from'react'
 import{createChart,CrosshairMode,LineStyle}from'lightweight-charts'
 import useStore from'../store/useStore'
-import{fmt,pct,sign,arr,absn,getMeta}from'../utils'
+import{fmt,pct,sign,arr,absn,getMeta,SYM_TO_KEY}from'../utils'
 
 const LOC_LINES=[
   {k:"ul",  label:"UL",  color:"#80deea",dash:false},
@@ -18,8 +18,10 @@ const TF_OPTS=[
   {label:"1d",  unit:"days",    interval:1,  days:90},
 ]
 
-export default function ChartModal({instrKey,onClose}){
-  const{marketData,locResults}=useStore()
+export default function ChartModal({instrKey:rawKey,onClose}){
+  const{marketData,locResults,spotKeys}=useStore()
+  // Resolve symbol names (e.g. "RELIANCE") to instrument keys (e.g. "NSE_EQ|INE002A01018")
+  const instrKey = rawKey.includes("|") ? rawKey : (spotKeys[rawKey]||SYM_TO_KEY[rawKey]||rawKey)
   const[tfIdx,setTfIdx]=useState(0)
   const[candles,setCandles]=useState([])
   const[loading,setLoading]=useState(false)
@@ -28,7 +30,7 @@ export default function ChartModal({instrKey,onClose}){
   const seriesRef=useRef(null)
 
   const meta=getMeta(instrKey,marketData[instrKey])
-  const sym=meta.s||""
+  const sym=meta.s||rawKey
   const d=marketData[instrKey]||{}
   const ltpc=d.ltpc||{}; const ef=d.efeed||{}
   const ltp=ltpc.ltp||ef.ltp||0

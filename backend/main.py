@@ -42,7 +42,8 @@ from .instruments import (
     get_spot_keys, mcx_key, get_current_and_next_expiry, get_itm2_strikes,
     fetch_expiry_list, fetch_option_chain, fetch_quotes_rest, fetch_index_quotes,
     fetch_option_ohlc_rest, fetch_intraday_candles,
-    validate_mcx_keys, calculate_expiries_fallback, normalize_mcx_response_key,
+    validate_mcx_keys, calculate_expiries_fallback,
+    normalize_mcx_response_key, normalize_response_key,
     refresh_nse_eq_keys, STRIKE_STEPS, MONTHLY_SYMBOLS
 )
 from . import instrument_keys as _ik
@@ -540,11 +541,11 @@ async def ws_browser(ws: WebSocket):
 async def broadcast(msg: dict):
     if msg.get("type") == "live_feed":
         ts = int(msg.get("currentTs",0) or time.time()*1000)
-        # Normalize MCX keys: name-based → numeric (if instrument master loaded)
+        # Normalize response keys: MCX name→numeric, NSE_EQ symbol→ISIN
         raw_feeds = msg.get("feeds", {})
         feeds = {}
         for k, fv in raw_feeds.items():
-            feeds[normalize_mcx_response_key(k)] = fv
+            feeds[normalize_response_key(k)] = fv
         msg["feeds"] = feeds
         for k, fv in feeds.items():
             ltp, cp, o, h, l = _ex(fv)

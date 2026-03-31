@@ -8,7 +8,7 @@ export default function Stocks({onOpenChart,onAddToWatchlist}){
   const[search,setSearch]=useState("")
   const stocks=Object.entries(marketData).filter(([k])=>!SPOT_META[k])
   const filtered=stocks.filter(([k,d])=>{
-    const m=getMeta(k);const nm=m.n.toLowerCase()
+    const m=getMeta(k,d);const nm=m.n.toLowerCase()
     const loc=locResults[m.s]
     const zf=filter==="all"||(loc?.zone===filter)
     return zf&&(!search||nm.includes(search.toLowerCase())||k.toLowerCase().includes(search.toLowerCase()))
@@ -31,7 +31,7 @@ export default function Stocks({onOpenChart,onAddToWatchlist}){
       <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(148px,1fr))",gap:7}}>
         {filtered.map(([k,d])=>(
           <div key={k} onContextMenu={e=>{e.preventDefault();onAddToWatchlist(k)}}>
-            <StockCard data={d} meta={getMeta(k)} loc={locResults[getMeta(k).s]||null}
+            <StockCard data={d} meta={getMeta(k,d)} loc={locResults[getMeta(k,d).s]||null}
               selected={false} onClick={()=>onOpenChart(k)}/>
           </div>
         ))}

@@ -382,7 +382,7 @@ async def fetch_quotes_rest(keys: list, token: str) -> dict:
                     for resp_key, val in data.items():
                         if val is None: continue
                         try:
-                            norm = normalize_mcx_response_key(resp_key.replace(":", "|", 1))
+                            norm = normalize_response_key(resp_key.replace(":", "|", 1))
                             ltp  = float(val.get("last_price") or 0)
                             # v3 has live_ohlc and prev_ohlc
                             live = val.get("live_ohlc") or {}
@@ -414,7 +414,7 @@ async def fetch_quotes_rest(keys: list, token: str) -> dict:
                         data2 = (r2.json() or {}).get("data") or {}
                         for resp_key, val in data2.items():
                             if not val: continue
-                            norm = normalize_mcx_response_key(resp_key.replace(":", "|", 1))
+                            norm = normalize_response_key(resp_key.replace(":", "|", 1))
                             ohlc = val.get("ohlc") or {}
                             ltp  = float(val.get("last_price") or ohlc.get("close") or 0)
                             cp   = float(ohlc.get("close") or 0)
@@ -568,6 +568,32 @@ def normalize_mcx_response_key(key: str) -> str:
     """
     if key.startswith("MCX_FO|") and not key.split("|")[1][:1].isdigit():
         return _mcx_name_to_numeric.get(key, key)
+    return key
+
+
+def normalize_nse_eq_response_key(key: str) -> str:
+    """Convert symbol-based NSE_EQ key to ISIN instrument_key.
+    Upstox REST API returns 'NSE_EQ|ITC' but we need 'NSE_EQ|INE154A01025'.
+    ISIN format: INE + 3 alphanum + letter + 5 digits (e.g. INE154A01025)
+    """
+    if key.startswith("NSE_EQ|"):
+        sym_part = key.split("|", 1)[1]
+        # Check if already in ISIN format (INE followed by digits/letters, 12 chars)
+        is_isin = (len(sym_part) == 12 and sym_part[:3] == "INE"
+                   and sym_part[3:6].isalnum() and sym_part[6:12].isalnum())
+        if not is_isin:
+            isin_key = _nse_eq_sym_to_key.get(sym_part, "")
+            if isin_key:
+                return isin_key
+    return key
+
+
+def normalize_response_key(key: str) -> str:
+    """Normalize any API response key to our canonical instrument_key format."""
+    if key.startswith("MCX_FO|"):
+        return normalize_mcx_response_key(key)
+    if key.startswith("NSE_EQ|"):
+        return normalize_nse_eq_response_key(key)
     return key
 
 
