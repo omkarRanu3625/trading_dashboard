@@ -42,10 +42,12 @@ INDEX_SPOT = {
     "BANKEX":     "BSE_INDEX|BANKEX",
 }
 
+_validated_mcx: dict = {}   # Set by validate_mcx_keys(), used by get_spot_keys()
+
 def get_spot_keys() -> dict:
     keys = dict(INDEX_SPOT)
-    for s in ["CRUDEOIL","NATURALGAS","GOLD","SILVER"]:
-        keys[s] = mcx_key(s, 0)
+    for s in ["CRUDEOIL","NATURALGAS","GOLD","SILVER","COPPER"]:
+        keys[s] = _validated_mcx.get(s, mcx_key(s, 0))
     return keys
 
 def get_itm2_strikes(spot: float, symbol: str) -> tuple:
@@ -83,7 +85,13 @@ async def fetch_expiry_list(symbol: str, token: str) -> list:
     """Extract unique expiry dates from /v2/option/contract response."""
     spot_keys = get_spot_keys()
     spot_key  = spot_keys.get(symbol.upper(), "")
+    if not spot_key:
+        from .instrument_keys import NSE_EQ_KEYS
+        spot_key = NSE_EQ_KEYS.get(symbol.upper(), "")
     if not spot_key: return calculate_expiries_fallback(symbol)
+    # For MCX, use option underlying key if available
+    if spot_key.startswith("MCX"):
+        spot_key = _mcx_option_underlying.get(symbol.upper(), spot_key)
     try:
         async with httpx.AsyncClient(timeout=15) as c:
             r = await c.get(UPSTOX_CONTRACTS, params={"instrument_key": spot_key}, headers=_h(token))
@@ -102,17 +110,172 @@ async def fetch_expiry_list(symbol: str, token: str) -> list:
         print(f"[Expiry] {symbol}: {e}")
     return calculate_expiries_fallback(symbol)
 
+# ── MCX option chain (built from contracts + quotes) ────────────
+async def _fetch_mcx_option_chain(symbol: str, expiry: str, token: str) -> dict:
+    """
+    Build MCX option chain from /v2/option/contract + /v2/market-quote/quotes.
+    The /v2/option/chain endpoint doesn't return data for MCX, so we build it manually.
+    """
+    spot_keys = get_spot_keys()
+    spot_key  = spot_keys.get(symbol.upper(), "")
+    if not spot_key or not expiry: return {}
+
+    # Use option underlying key if different from spot key (e.g., GOLD)
+    option_key = _mcx_option_underlying.get(symbol.upper(), spot_key)
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            # Step 1: Get contracts for this expiry
+            r = await c.get(UPSTOX_CONTRACTS,
+                            params={"instrument_key": option_key},
+                            headers=_h(token))
+            if r.status_code != 200:
+                print(f"[MCXChain] {symbol} contracts HTTP {r.status_code}")
+                return {}
+
+            contracts = r.json().get("data", [])
+            filtered = [ct for ct in contracts
+                        if isinstance(ct, dict) and ct.get("expiry") == expiry]
+            if not filtered:
+                print(f"[MCXChain] {symbol}/{expiry} no contracts")
+                return {}
+
+            # Step 2: Group by strike
+            strike_map = {}  # strike → {CE: key, PE: key}
+            for ct in filtered:
+                strike = float(ct.get("strike_price", 0))
+                opt_type = ct.get("instrument_type", "")
+                ikey = ct.get("instrument_key", "")
+                if strike and opt_type in ("CE", "PE") and ikey:
+                    strike_map.setdefault(strike, {})[opt_type] = ikey
+
+            if not strike_map:
+                print(f"[MCXChain] {symbol}/{expiry} no strikes")
+                return {}
+
+            # Step 3: Get spot price from futures quote
+            r2 = await c.get(UPSTOX_QUOTE_V2,
+                             params={"instrument_key": spot_key},
+                             headers=_h(token))
+            spot_from_quote = 0.0
+            if r2.status_code == 200:
+                for _, v in (r2.json().get("data", {}) or {}).items():
+                    if v:
+                        spot_from_quote = float(v.get("last_price", 0))
+                        break
+
+            # Step 4: Find ITM-2 strikes and nearby strikes, fetch their quotes
+            step = STRIKE_STEPS.get(symbol.upper(), 50)
+            if spot_from_quote:
+                atm = round(round(spot_from_quote / step) * step, 2)
+                ce_target = atm - 2 * step
+                pe_target = atm + 2 * step
+            else:
+                sorted_s = sorted(strike_map.keys())
+                ce_target = sorted_s[len(sorted_s) // 2]
+                pe_target = ce_target
+
+            # Collect keys for strikes near ATM (within ±10 strikes)
+            sorted_strikes = sorted(strike_map.keys())
+            atm_idx = min(range(len(sorted_strikes)),
+                          key=lambda i: abs(sorted_strikes[i] - (ce_target + pe_target) / 2))
+            lo = max(0, atm_idx - 10)
+            hi = min(len(sorted_strikes), atm_idx + 11)
+            nearby_strikes = sorted_strikes[lo:hi]
+
+            quote_keys = []
+            for s in nearby_strikes:
+                if "CE" in strike_map[s]: quote_keys.append(strike_map[s]["CE"])
+                if "PE" in strike_map[s]: quote_keys.append(strike_map[s]["PE"])
+
+            # Step 5: Fetch quotes in chunks
+            # MCX API returns name-based keys (MCX_FO:CRUDEOIL26APR9450CE)
+            # even when we request numeric keys (MCX_FO|562412).
+            # Use _mcx_numeric_to_name to map between formats.
+            quotes = {}
+            for i in range(0, len(quote_keys), 25):
+                chunk = quote_keys[i:i+25]
+                r3 = await c.get(UPSTOX_QUOTE_V2,
+                                 params={"instrument_key": ",".join(chunk)},
+                                 headers=_h(token))
+                if r3.status_code == 200:
+                    resp_data = (r3.json().get("data", {}) or {})
+                    # Map response name-based keys to numeric keys
+                    for rk, rv in resp_data.items():
+                        if rv:
+                            # Store by response key
+                            quotes[rk.replace(":", "|", 1)] = rv
+                    # Map requested numeric keys → name-based response keys
+                    for req_key in chunk:
+                        name_key = _mcx_numeric_to_name.get(req_key, "")
+                        if name_key:
+                            colon_name = name_key.replace("|", ":", 1)
+                            val = resp_data.get(colon_name)
+                            if val:
+                                quotes[req_key] = val
+                await asyncio.sleep(0.2)
+
+            # Step 6: Build chain dict
+            chain = {}
+            for strike in nearby_strikes:
+                ce_key = strike_map[strike].get("CE", "")
+                pe_key = strike_map[strike].get("PE", "")
+                ce_q = quotes.get(ce_key, {})
+                pe_q = quotes.get(pe_key, {})
+                ce_ohlc = ce_q.get("ohlc", {}) or {}
+                pe_ohlc = pe_q.get("ohlc", {}) or {}
+
+                chain[strike] = {
+                    "CE": {
+                        "ltp":   float(ce_q.get("last_price", 0) or 0),
+                        "close": float(ce_ohlc.get("close", 0) or 0),
+                        "high":  float(ce_ohlc.get("high", 0) or 0),
+                        "low":   float(ce_ohlc.get("low", 0) or 0),
+                        "oi":    float(ce_q.get("oi", 0) or 0),
+                        "iv":    0.0,
+                        "key":   ce_key,
+                    },
+                    "PE": {
+                        "ltp":   float(pe_q.get("last_price", 0) or 0),
+                        "close": float(pe_ohlc.get("close", 0) or 0),
+                        "high":  float(pe_ohlc.get("high", 0) or 0),
+                        "low":   float(pe_ohlc.get("low", 0) or 0),
+                        "oi":    float(pe_q.get("oi", 0) or 0),
+                        "iv":    0.0,
+                        "key":   pe_key,
+                    },
+                    "_spot": spot_from_quote,
+                }
+
+            if chain:
+                atm_s = min(chain.keys(), key=lambda s: abs(s - (spot_from_quote or ce_target)))
+                print(f"[MCXChain] {symbol}/{expiry}: {len(chain)} strikes, "
+                      f"spot={spot_from_quote}, ATM={atm_s}, "
+                      f"CE_ltp={chain[atm_s]['CE']['ltp']}")
+            return chain
+
+    except Exception as e:
+        print(f"[MCXChain] {symbol}/{expiry}: {e}")
+        return {}
+
+
 # ── Option chain ─────────────────────────────────────────────────
 async def fetch_option_chain(symbol: str, expiry: str, token: str) -> dict:
     """
     Fetch full option chain. Returns {strike: {CE:{...}, PE:{...}}}.
     Also returns the spot price from underlying_spot_price field.
-    MCX not supported — returns {} for MCX symbols.
+    Supports indices (NSE_INDEX), MCX commodities, and FNO stocks (NSE_EQ).
     """
     spot_keys = get_spot_keys()
     spot_key  = spot_keys.get(symbol.upper(), "")
+    if not spot_key:
+        from .instrument_keys import NSE_EQ_KEYS
+        spot_key = NSE_EQ_KEYS.get(symbol.upper(), "")
     if not spot_key or not expiry: return {}
-    if spot_key.startswith("MCX"): return {}  # MCX chain not supported
+
+    # MCX uses contract-based chain building (option/chain API doesn't support MCX)
+    if spot_key.startswith("MCX"):
+        return await _fetch_mcx_option_chain(symbol, expiry, token)
 
     try:
         async with httpx.AsyncClient(timeout=20) as c:
@@ -219,7 +382,7 @@ async def fetch_quotes_rest(keys: list, token: str) -> dict:
                     for resp_key, val in data.items():
                         if val is None: continue
                         try:
-                            norm = normalize_mcx_response_key(resp_key.replace(":", "|", 1))
+                            norm = normalize_response_key(resp_key.replace(":", "|", 1))
                             ltp  = float(val.get("last_price") or 0)
                             # v3 has live_ohlc and prev_ohlc
                             live = val.get("live_ohlc") or {}
@@ -251,7 +414,7 @@ async def fetch_quotes_rest(keys: list, token: str) -> dict:
                         data2 = (r2.json() or {}).get("data") or {}
                         for resp_key, val in data2.items():
                             if not val: continue
-                            norm = normalize_mcx_response_key(resp_key.replace(":", "|", 1))
+                            norm = normalize_response_key(resp_key.replace(":", "|", 1))
                             ohlc = val.get("ohlc") or {}
                             ltp  = float(val.get("last_price") or ohlc.get("close") or 0)
                             cp   = float(ohlc.get("close") or 0)
@@ -339,6 +502,8 @@ _MCX_INSTRUMENT_MASTER_URL = "https://assets.upstox.com/market-quote/instruments
 _mcx_sym_to_key: dict = {}
 # Reverse: name-based key → numeric key (e.g. "MCX_FO|CRUDEOIL26APRFUT" → "MCX_FO|486502")
 _mcx_name_to_numeric: dict = {}
+# Reverse: numeric key → name-based key for MCX (e.g. "MCX_FO|562412" → "MCX_FO|CRUDEOIL26APR9450CE")
+_mcx_numeric_to_name: dict = {}
 # NSE_EQ tradingsymbol → instrument_key (e.g. "RELIANCE" → "NSE_EQ|INE002A01018")
 _nse_eq_sym_to_key: dict = {}
 
@@ -366,9 +531,10 @@ async def _load_mcx_instrument_master():
                 inst_key = cols[0].strip('"')
                 trading_sym = cols[2].strip('"')
                 if exchange == "MCX_FO":
+                    _mcx_name_to_numeric[f"MCX_FO|{trading_sym}"] = inst_key
+                    _mcx_numeric_to_name[inst_key] = f"MCX_FO|{trading_sym}"
                     if "FUT" in trading_sym:
                         _mcx_sym_to_key[trading_sym] = inst_key
-                        _mcx_name_to_numeric[f"MCX_FO|{trading_sym}"] = inst_key
                 elif exchange == "NSE_EQ":
                     _nse_eq_sym_to_key[trading_sym] = inst_key
                     nse_count += 1
@@ -405,6 +571,32 @@ def normalize_mcx_response_key(key: str) -> str:
     return key
 
 
+def normalize_nse_eq_response_key(key: str) -> str:
+    """Convert symbol-based NSE_EQ key to ISIN instrument_key.
+    Upstox REST API returns 'NSE_EQ|ITC' but we need 'NSE_EQ|INE154A01025'.
+    ISIN format: INE + 3 alphanum + letter + 5 digits (e.g. INE154A01025)
+    """
+    if key.startswith("NSE_EQ|"):
+        sym_part = key.split("|", 1)[1]
+        # Check if already in ISIN format (INE followed by digits/letters, 12 chars)
+        is_isin = (len(sym_part) == 12 and sym_part[:3] == "INE"
+                   and sym_part[3:6].isalnum() and sym_part[6:12].isalnum())
+        if not is_isin:
+            isin_key = _nse_eq_sym_to_key.get(sym_part, "")
+            if isin_key:
+                return isin_key
+    return key
+
+
+def normalize_response_key(key: str) -> str:
+    """Normalize any API response key to our canonical instrument_key format."""
+    if key.startswith("MCX_FO|"):
+        return normalize_mcx_response_key(key)
+    if key.startswith("NSE_EQ|"):
+        return normalize_nse_eq_response_key(key)
+    return key
+
+
 def _resolve_mcx_key(sym: str, months_ahead: int) -> str:
     """Resolve a commodity symbol to its correct Upstox instrument_key."""
     d = date.today() + timedelta(days=30 * months_ahead)
@@ -416,13 +608,17 @@ def _resolve_mcx_key(sym: str, months_ahead: int) -> str:
     return f"MCX_FO|{trading_sym}"
 
 
+# MCX option underlying keys (may differ from spot futures key)
+_mcx_option_underlying: dict = {}   # sym → instrument_key for option chain
+
 async def validate_mcx_keys(token: str) -> dict:
     """Find correct MCX instrument keys from the instrument master."""
+    global _validated_mcx, _mcx_option_underlying
     await _load_mcx_instrument_master()
 
     result = {}
     today = date.today()
-    for sym in ["CRUDEOIL", "NATURALGAS", "GOLD", "SILVER"]:
+    for sym in ["CRUDEOIL", "NATURALGAS", "GOLD", "SILVER", "COPPER"]:
         found = False
         # Search instrument master for nearest unexpired futures
         candidates = []
@@ -470,6 +666,59 @@ async def validate_mcx_keys(token: str) -> dict:
             if not found:
                 result[sym] = _resolve_mcx_key(sym, 1)
                 print(f"[MCX] {sym} → fallback {result[sym]}")
+    _validated_mcx = result
+
+    # Find option underlying keys (may differ from spot futures for some commodities)
+    if token:
+        for sym in result:
+            spot_key = result[sym]
+            try:
+                async with httpx.AsyncClient(timeout=10) as c:
+                    r = await c.get(UPSTOX_CONTRACTS,
+                                    params={"instrument_key": spot_key},
+                                    headers=_h(token))
+                    if r.status_code == 200:
+                        contracts = r.json().get("data", [])
+                        if contracts:
+                            _mcx_option_underlying[sym] = spot_key
+                            print(f"[MCX] {sym} options on {spot_key}: {len(contracts)} contracts")
+                            continue
+                # If spot key has no contracts, try other futures for this symbol
+                candidates = []
+                for tsym, ikey in _mcx_sym_to_key.items():
+                    if tsym.startswith(sym) and tsym.endswith("FUT"):
+                        suffix = tsym[len(sym):]
+                        if suffix[0:1] == "M" and suffix[1:2].isdigit():
+                            continue
+                        if any(v in tsym for v in ["PETAL", "GUINEA", "TEN", "MIC"]):
+                            continue
+                        if ikey != spot_key:
+                            candidates.append((tsym, ikey))
+                # Sort by expiry proximity
+                def _parse_exp(tsym):
+                    s = tsym[len(sym):]
+                    try: return date(int("20" + s[:2]), _M.index(s[2:5]) + 1, 1)
+                    except: return date(2099, 1, 1)
+                candidates.sort(key=lambda x: _parse_exp(x[0]))
+                for tsym, ikey in candidates:
+                    try:
+                        async with httpx.AsyncClient(timeout=10) as c:
+                            r = await c.get(UPSTOX_CONTRACTS,
+                                            params={"instrument_key": ikey},
+                                            headers=_h(token))
+                            if r.status_code == 200:
+                                contracts = r.json().get("data", [])
+                                if contracts:
+                                    _mcx_option_underlying[sym] = ikey
+                                    print(f"[MCX] {sym} options on {ikey} ({tsym}): {len(contracts)} contracts")
+                                    break
+                    except:
+                        pass
+                    await asyncio.sleep(0.2)
+            except Exception as e:
+                print(f"[MCX] {sym} option key search: {e}")
+            await asyncio.sleep(0.2)
+
     return result
 
 

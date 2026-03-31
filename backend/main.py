@@ -42,15 +42,18 @@ from .instruments import (
     get_spot_keys, mcx_key, get_current_and_next_expiry, get_itm2_strikes,
     fetch_expiry_list, fetch_option_chain, fetch_quotes_rest, fetch_index_quotes,
     fetch_option_ohlc_rest, fetch_intraday_candles,
-    validate_mcx_keys, calculate_expiries_fallback, normalize_mcx_response_key,
+    validate_mcx_keys, calculate_expiries_fallback,
+    normalize_mcx_response_key, normalize_response_key,
     refresh_nse_eq_keys, STRIKE_STEPS, MONTHLY_SYMBOLS
 )
 from . import instrument_keys as _ik
 from .instrument_keys import NSE_EQ_KEYS
 from .loc_engine import LOCEngine
 
-LOC_SYMBOLS = ["NIFTY","BANKNIFTY","FINNIFTY","MIDCPNIFTY","SENSEX",
-               "CRUDEOIL","NATURALGAS","GOLD","SILVER"]
+_INDEX_LOC  = ["NIFTY","BANKNIFTY","FINNIFTY","MIDCPNIFTY","SENSEX","BANKEX"]
+_MCX_LOC    = ["CRUDEOIL","NATURALGAS","GOLD","SILVER","COPPER"]
+LOC_SYMBOLS = _INDEX_LOC + _MCX_LOC + [s for s in NSE_EQ_KEYS if s not in _INDEX_LOC + _MCX_LOC]
+LOC_SYMBOLS_SET = set(LOC_SYMBOLS)
 
 # ── Dynamic instrument keys ────────────────────────────────────────
 INDEX_KEYS = [
@@ -60,7 +63,7 @@ INDEX_KEYS = [
 ]
 
 # Will be updated at startup after validate_mcx_keys()
-COMMODITY_KEYS = [mcx_key(s,0) for s in ["CRUDEOIL","NATURALGAS","GOLD","SILVER"]]
+COMMODITY_KEYS = [mcx_key(s,0) for s in ["CRUDEOIL","NATURALGAS","GOLD","SILVER","COPPER"]]
 SPOT_KEYS_D: dict = {}   # filled at startup
 
 # Feed key → LOC symbol (for routing to LOC engine)
@@ -290,7 +293,7 @@ def _record_loc_hist(sym, loc):
 def _route_tick(key, ltp, cp, o, h, l, ts):
     if not ltp: return
     sym = FEED_KEY_TO_SYM.get(key)
-    if sym and sym in LOC_SYMBOLS:
+    if sym and sym in LOC_SYMBOLS_SET:
         loc_engine.update_spot(sym, ltp, cp, h, l, ts, o)
         return
     if key in option_key_map:
@@ -311,15 +314,18 @@ async def startup_init():
         print("[Init] Validating MCX keys...")
         valid_mcx = await validate_mcx_keys(state.access_token)
     else:
-        valid_mcx = {s: mcx_key(s,0) for s in ["CRUDEOIL","NATURALGAS","GOLD","SILVER"]}
+        valid_mcx = {s: mcx_key(s,0) for s in ["CRUDEOIL","NATURALGAS","GOLD","SILVER","COPPER"]}
 
     # Step 2: Build SPOT_KEYS_D and COMMODITY_KEYS
     SPOT_KEYS_D = dict(get_spot_keys())
     for sym, key in valid_mcx.items():
         SPOT_KEYS_D[sym] = key
+    # Add FNO stock keys to SPOT_KEYS_D
+    for sym, key in _ik.NSE_EQ_KEYS.items():
+        SPOT_KEYS_D[sym] = key
 
     COMMODITY_KEYS = list(dict.fromkeys(
-        [valid_mcx.get(s, mcx_key(s,0)) for s in ["CRUDEOIL","NATURALGAS","GOLD","SILVER"]] +
+        [valid_mcx.get(s, mcx_key(s,0)) for s in ["CRUDEOIL","NATURALGAS","GOLD","SILVER","COPPER"]] +
         [mcx_key(s,1) for s in ["CRUDEOIL","NATURALGAS"]]
     ))
 
@@ -330,39 +336,77 @@ async def startup_init():
     FEED_KEY_TO_SYM.clear()
     for sym, key in SPOT_KEYS_D.items():
         FEED_KEY_TO_SYM[key] = sym
-    for s in ["CRUDEOIL","NATURALGAS","GOLD","SILVER"]:
+    for s in ["CRUDEOIL","NATURALGAS","GOLD","SILVER","COPPER"]:
         for m in [0,1,2]:
             FEED_KEY_TO_SYM[mcx_key(s,m)] = s
     # Also map updated NSE_EQ keys
     for sym, key in _ik.NSE_EQ_KEYS.items():
         FEED_KEY_TO_SYM[key] = sym
 
-    print(f"[Init] Spot keys: {SPOT_KEYS_D}")
     print(f"[Init] Commodity keys: {COMMODITY_KEYS}")
+    print(f"[Init] LOC symbols: {len(LOC_SYMBOLS)} ({len(_INDEX_LOC)} idx + {len(_MCX_LOC)} mcx + {len(LOC_SYMBOLS)-len(_INDEX_LOC)-len(_MCX_LOC)} stocks)")
 
-    # Step 4: Fetch expiries
-    for sym in LOC_SYMBOLS:
-        try:
-            if state.access_token:
-                expiries = await fetch_expiry_list(sym, state.access_token)
-            else:
-                expiries = calculate_expiries_fallback(sym)
-            info = get_current_and_next_expiry(expiries, sym)
-            state.expiry_cache[sym] = info
-            default = info.get("default")
-            if default:
-                loc_engine.set_expiry(sym, default)
-                print(f"[Init] {sym} expiry={default}")
-        except Exception as e:
-            print(f"[Init] {sym} expiry: {e}")
+    # Step 5: Fetch expiries — parallel with concurrency limit
+    expiry_sem = asyncio.Semaphore(5)
+
+    async def _init_expiry(sym):
+        async with expiry_sem:
+            try:
+                if state.access_token:
+                    expiries = await fetch_expiry_list(sym, state.access_token)
+                else:
+                    expiries = calculate_expiries_fallback(sym)
+                info = get_current_and_next_expiry(expiries, sym)
+                state.expiry_cache[sym] = info
+                default = info.get("default")
+                if default:
+                    loc_engine.set_expiry(sym, default, fetch_chain=False)
+            except Exception as e:
+                print(f"[Init] {sym} expiry: {e}")
+            await asyncio.sleep(0.2)
+
+    # Priority: indices + MCX first, then stocks
+    priority = [s for s in LOC_SYMBOLS if s in _INDEX_LOC + _MCX_LOC]
+    stock_syms = [s for s in LOC_SYMBOLS if s not in priority]
+    await asyncio.gather(*[_init_expiry(s) for s in priority])
+    print(f"[Init] Index/MCX expiries loaded: {len([s for s in priority if s in state.expiry_cache])}")
+    await asyncio.gather(*[_init_expiry(s) for s in stock_syms])
+    print(f"[Init] All expiries loaded: {len(state.expiry_cache)} symbols")
 
     await broadcast({"type":"expiry_update","expiry_cache":state.expiry_cache})
 
-    # Step 5: Initial OHLC snapshot for stocks + indices
+    # Step 6: Fetch option chains — parallel with concurrency limit
+    chain_sem = asyncio.Semaphore(3)
+    chain_count = [0]
+
+    async def _init_chain(sym):
+        async with chain_sem:
+            st = loc_engine.get_state(sym)
+            if not st or not st.expiry: return
+            try:
+                chain = await fetch_option_chain(sym, st.expiry, state.access_token)
+                if chain:
+                    loc_engine.update_chain(sym, chain)
+                    chain_count[0] += 1
+            except Exception as e:
+                print(f"[Init] {sym} chain: {e}")
+            await asyncio.sleep(0.3)
+
+    if state.access_token:
+        # Priority chains first
+        await asyncio.gather(*[_init_chain(s) for s in priority])
+        print(f"[Init] Index/MCX chains loaded: {chain_count[0]}")
+        # Stock chains in batches of 20
+        for i in range(0, len(stock_syms), 20):
+            batch = stock_syms[i:i+20]
+            await asyncio.gather(*[_init_chain(s) for s in batch])
+        print(f"[Init] All chains loaded: {chain_count[0]} symbols")
+
+    # Step 7: Initial OHLC snapshot for stocks + indices
     if state.access_token:
         print("[Init] Fetching initial OHLC snapshot...")
         # Stocks and commodities via /v3/ohlc
-        stock_comm_keys = list(dict.fromkeys(_ik.FO_STOCK_KEYS + COMMODITY_KEYS[:4]))
+        stock_comm_keys = list(dict.fromkeys(_ik.FO_STOCK_KEYS + COMMODITY_KEYS[:5]))
         data = await fetch_quotes_rest(stock_comm_keys, state.access_token)
         # Indices via /v2/market-quote/quotes
         idx_data = await fetch_index_quotes(INDEX_KEYS, state.access_token)
@@ -389,8 +433,7 @@ async def startup_init():
             "market_status":state.market_status,
         })
 
-    # Step 6: Re-subscribe Upstox feed to validated commodity keys
-    # (start_feed() subscribed to stale module-level keys before validation)
+    # Step 8: Re-subscribe Upstox feed to validated commodity keys
     if state.upstox_ws and COMMODITY_KEYS:
         try:
             await _sub_text(state.upstox_ws, COMMODITY_KEYS, "full")
@@ -498,11 +541,11 @@ async def ws_browser(ws: WebSocket):
 async def broadcast(msg: dict):
     if msg.get("type") == "live_feed":
         ts = int(msg.get("currentTs",0) or time.time()*1000)
-        # Normalize MCX keys: name-based → numeric (if instrument master loaded)
+        # Normalize response keys: MCX name→numeric, NSE_EQ symbol→ISIN
         raw_feeds = msg.get("feeds", {})
         feeds = {}
         for k, fv in raw_feeds.items():
-            feeds[normalize_mcx_response_key(k)] = fv
+            feeds[normalize_response_key(k)] = fv
         msg["feeds"] = feeds
         for k, fv in feeds.items():
             ltp, cp, o, h, l = _ex(fv)
@@ -889,7 +932,7 @@ async def on_startup():
     global SPOT_KEYS_D, FEED_KEY_TO_SYM
     SPOT_KEYS_D = get_spot_keys()
     FEED_KEY_TO_SYM = {v:k for k,v in SPOT_KEYS_D.items()}
-    for s in ["CRUDEOIL","NATURALGAS","GOLD","SILVER"]:
+    for s in ["CRUDEOIL","NATURALGAS","GOLD","SILVER","COPPER"]:
         for m in [0,1,2]: FEED_KEY_TO_SYM[mcx_key(s,m)] = s
 
     if USE_MOCK:

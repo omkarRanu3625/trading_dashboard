@@ -134,11 +134,12 @@ class LOCEngine:
     def get_state(self, symbol:str)->Optional[SymbolState]:
         return self.symbols.get(symbol)
 
-    def set_expiry(self, symbol:str, expiry:str):
+    def set_expiry(self, symbol:str, expiry:str, fetch_chain:bool=True):
         st=self.symbols.get(symbol)
         if st:
             st.expiry=expiry
-            asyncio.create_task(self._refresh_chain(symbol))
+            if fetch_chain:
+                asyncio.create_task(self._refresh_chain(symbol))
 
     def update_spot(self, symbol:str, ltp:float, close:float,
                     high:float, low:float, ts:int, open_:float=0):
@@ -187,6 +188,16 @@ class LOCEngine:
         if not st or not chain: return
         st.option_chain = chain
 
+        # Auto-detect strike step from chain data
+        strikes = sorted(chain.keys())
+        if len(strikes) >= 3:
+            diffs = [round(strikes[i+1] - strikes[i], 2)
+                     for i in range(min(10, len(strikes)-1))]
+            if diffs:
+                step = max(set(diffs), key=diffs.count)
+                if step > 0:
+                    STRIKE_STEPS[symbol.upper()] = step
+
         # Extract underlying spot from chain rows
         chain_spot = 0.0
         for row in chain.values():
@@ -225,14 +236,16 @@ class LOCEngine:
 
         if not ce_row or not pe_row:
             # Strikes not in chain — find nearest available strikes
+            step = STRIKE_STEPS.get(symbol.upper(), 50)
+            tolerance = step * 4
             strikes = sorted(st.option_chain.keys())
             if strikes:
                 nearest_ce = min(strikes, key=lambda s: abs(s - st.ce_strike))
                 nearest_pe = min(strikes, key=lambda s: abs(s - st.pe_strike))
-                if abs(nearest_ce - st.ce_strike) < 200:
+                if abs(nearest_ce - st.ce_strike) < tolerance:
                     ce_row = st.option_chain.get(nearest_ce, {})
                     if ce_row: st.ce_strike = nearest_ce
-                if abs(nearest_pe - st.pe_strike) < 200:
+                if abs(nearest_pe - st.pe_strike) < tolerance:
                     pe_row = st.option_chain.get(nearest_pe, {})
                     if pe_row: st.pe_strike = nearest_pe
 

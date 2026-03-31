@@ -1,10 +1,23 @@
-import{useState,useEffect}from'react'
+import{useState,useEffect,useMemo}from'react'
 import useStore from'../store/useStore'
 import{fmt,ts2t,LOC_SYMS}from'../utils'
 export default function History(){
-  const{locHistory,setLocHistory}=useStore()
+  const{locHistory,setLocHistory,locResults}=useStore()
   const[sym,setSym]=useState("NIFTY")
+  const[search,setSearch]=useState("")
   const hist=locHistory[sym]||[]
+  // All symbols with LOC data — indices/MCX first, then stocks sorted
+  const allSyms=useMemo(()=>{
+    const fromLoc=Object.keys(locResults)
+    const merged=[...new Set([...LOC_SYMS,...fromLoc])]
+    const priority=new Set(LOC_SYMS)
+    return merged.sort((a,b)=>{
+      const ap=priority.has(a)?0:1, bp=priority.has(b)?0:1
+      if(ap!==bp) return ap-bp
+      return a.localeCompare(b)
+    })
+  },[locResults])
+  const filteredSyms=search?allSyms.filter(s=>s.toLowerCase().includes(search.toLowerCase())):allSyms
   useEffect(()=>{
     if(!locHistory[sym]){
       fetch(`/api/loc-history/${sym}`).then(r=>r.json()).then(d=>setLocHistory(sym,d.history||[])).catch(()=>{})
@@ -22,8 +35,9 @@ export default function History(){
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12,flexWrap:"wrap",gap:8}}>
         <div style={{fontFamily:"'JetBrains Mono',monospace",fontSize:9,color:"#4a5568",textTransform:"uppercase",letterSpacing:".1em"}}>LOC Record — Every 1 Minute</div>
         <div style={{display:"flex",gap:8}}>
+          <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Filter symbols..." style={{padding:"4px 9px",fontSize:10,width:100}}/>
           <select value={sym} onChange={e=>setSym(e.target.value)} style={{padding:"4px 9px",fontSize:10}}>
-            {LOC_SYMS.map(s=><option key={s}>{s}</option>)}
+            {filteredSyms.map(s=><option key={s}>{s}</option>)}
           </select>
           <button onClick={exportCSV} style={{padding:"4px 10px",border:"1px solid #162033",background:"none",color:"#4a5568",borderRadius:4,fontSize:10}}>Export CSV</button>
         </div>

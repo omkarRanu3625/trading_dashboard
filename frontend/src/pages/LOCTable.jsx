@@ -1,6 +1,6 @@
 import{useState,useMemo}from'react'
 import useStore from'../store/useStore'
-import{fmt,absn,arr,getMeta}from'../utils'
+import{fmt,absn,arr,getMeta,SYM_TO_KEY}from'../utils'
 const TH=({label,k,sort,setSort,num})=>(
   <th onClick={()=>setSort(s=>({k,d:s.k===k?-s.d:1}))}
     style={{padding:"7px 10px",textAlign:num?"right":"left",fontFamily:"'JetBrains Mono',monospace",fontSize:8,
@@ -10,7 +10,7 @@ const TH=({label,k,sort,setSort,num})=>(
   </th>
 )
 export default function LOCTable({onOpenChart}){
-  const{locResults,marketData}=useStore()
+  const{locResults,marketData,spotKeys}=useStore()
   const[filter,setFilter]=useState("all")
   const[sort,setSort]=useState({k:"symbol",d:1})
   const rows=useMemo(()=>{
@@ -54,7 +54,7 @@ export default function LOCTable({onOpenChart}){
           </tr></thead>
           <tbody>
             {rows.map(({sym,loc,meta})=>(
-              <tr key={sym} onClick={()=>onOpenChart(sym)} style={{cursor:"pointer"}}
+              <tr key={sym} onClick={()=>onOpenChart(spotKeys[sym]||SYM_TO_KEY[sym]||sym)} style={{cursor:"pointer"}}
                 onMouseEnter={e=>e.currentTarget.style.background="rgba(255,255,255,.015)"}
                 onMouseLeave={e=>e.currentTarget.style.background=""}>
                 <td style={{padding:"7px 10px",fontFamily:"'JetBrains Mono',monospace",fontWeight:700,borderBottom:"1px solid rgba(22,32,51,.4)"}}>{sym}</td>

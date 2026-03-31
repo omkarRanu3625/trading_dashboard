@@ -56,7 +56,7 @@ export default function Dashboard({onOpenChart}){
   // Use dynamic commodity keys from server (updated at startup)
   // Fall back to detecting MCX keys from marketData
   const commKeys=(() => {
-    if(commodityKeys && commodityKeys.length>0) return commodityKeys.slice(0,4)
+    if(commodityKeys && commodityKeys.length>0) return commodityKeys.slice(0,5)
     // Fallback: find MCX keys in marketData
     return Object.keys(marketData).filter(k=>k.startsWith("MCX_FO|")).slice(0,4)
   })()
@@ -88,7 +88,7 @@ export default function Dashboard({onOpenChart}){
       <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(140px,1fr))",gap:7,marginBottom:18}}>
         {commKeys.length>0
           ? commKeys.map(k=><ComCard key={k} instrKey={k} data={marketData[k]||{}} onClick={()=>onOpenChart(k)}/>)
-          : ["CRUDEOIL","NATURALGAS","GOLD","SILVER"].map(n=>(
+          : ["CRUDEOIL","NATURALGAS","GOLD","SILVER","COPPER"].map(n=>(
               <div key={n} style={{background:"#0f1624",border:"1px solid #162033",borderRadius:8,padding:11}}>
                 <div style={{fontSize:9,color:"#4a5568",fontFamily:"'JetBrains Mono',monospace"}}>{n}</div>
                 <div style={{fontFamily:"'JetBrains Mono',monospace",fontSize:12,color:"#4a5568",marginTop:4}}>Loading...</div>

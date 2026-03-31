@@ -103,6 +103,15 @@ export const ISIN_TO_NAME = {
   "NSE_EQ|INE721I01028":"360ONE","NSE_EQ|INE007A01025":"PATANJALI",
 }
 
+// Reverse lookup: ISIN key → backend symbol (for LOC linking)
+const _isinToSymbol = {}
+// Build from spotKeys when they arrive
+export const buildIsinToSymbol = (spotKeys) => {
+  for (const [sym, ikey] of Object.entries(spotKeys||{})) {
+    if (ikey && ikey.startsWith("NSE_EQ|")) _isinToSymbol[ikey] = sym
+  }
+}
+
 // Spot meta for index and commodity
 export const SPOT_META = {
   "NSE_INDEX|Nifty 50":          {n:"NIFTY 50",s:"NIFTY",ico:"📈",cat:"index"},
@@ -115,7 +124,7 @@ export const SPOT_META = {
 }
 
 // MCX keys (dynamic month — check startsWith)
-const MCX_SYM = {CRUDEOIL:"🛢",NATURALGAS:"🔥",GOLD:"🥇",SILVER:"🪙"}
+const MCX_SYM = {CRUDEOIL:"🛢",NATURALGAS:"🔥",GOLD:"🥇",SILVER:"🪙",COPPER:"🔶"}
 
 // Reverse lookup: numeric MCX key → symbol name (built from spotKeys)
 let _mcxKeyToSym = {}
@@ -124,6 +133,7 @@ export const setMcxKeyMap = (spotKeys) => {
   for (const [sym, ikey] of Object.entries(spotKeys||{})) {
     if (ikey && ikey.startsWith("MCX_FO|")) _mcxKeyToSym[ikey] = sym
   }
+  buildIsinToSymbol(spotKeys)
 }
 
 export const getMeta = (key, data) => {
@@ -145,7 +155,8 @@ export const getMeta = (key, data) => {
   // NSE EQ stock (ISIN key)
   if (key.startsWith("NSE_EQ|")) {
     const nm = ISIN_TO_NAME[key] || data?.display_name || key.split("|")[1]?.substring(0,10) || key
-    return {n:nm, s:"", ico:"📊", cat:"stock"}
+    const sym = data?.display_name || _isinToSymbol[key] || ""
+    return {n:nm, s:sym, ico:"📊", cat:"stock"}
   }
   return {n:key.substring(0,12), s:"", ico:"📊", cat:"other"}
 }
@@ -156,4 +167,4 @@ export const SYM_TO_KEY = {
   SENSEX:"BSE_INDEX|SENSEX", BANKEX:"BSE_INDEX|BANKEX",
 }
 
-export const LOC_SYMS = ["NIFTY","BANKNIFTY","FINNIFTY","MIDCPNIFTY","SENSEX","CRUDEOIL","NATURALGAS","GOLD","SILVER"]
+export const LOC_SYMS = ["NIFTY","BANKNIFTY","FINNIFTY","MIDCPNIFTY","SENSEX","BANKEX","CRUDEOIL","NATURALGAS","GOLD","SILVER","COPPER"]
