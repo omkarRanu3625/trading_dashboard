@@ -191,9 +191,91 @@ def _pmi(d):
         else: break
     return seg
 
+try:
+    from upstox_client.feeder.proto import MarketDataFeedV3_pb2 as _pb
+    _HAS_PB = True
+except ImportError:
+    _HAS_PB = False
+
+_TYPE_MAP = {0: "initial_feed", 1: "live_feed", 2: "market_info"}
+_STATUS_MAP = {0:"PREOPEN",1:"PREOPEN",2:"NORMAL_OPEN",3:"CLOSED",4:"CLOSING",5:"CLOSED"}
+
+def _ohlc_list_to_efeed(ohlc_list):
+    """Extract day OHLC from MarketOHLC repeated field."""
+    ef = {}
+    for o in ohlc_list:
+        if o.interval in ("1d", "I1"):
+            ef["open"]  = round(o.open, 2) if o.open else 0
+            ef["high"]  = round(o.high, 2) if o.high else 0
+            ef["low"]   = round(o.low, 2) if o.low else 0
+            ef["ltp"]   = round(o.close, 2) if o.close else 0
+            ef["cp"]    = 0  # not in OHLC, comes from ltpc
+            break
+    return ef
+
+def _feed_to_dict(feed):
+    """Convert protobuf Feed message to dict compatible with frontend."""
+    r = {}
+    which = feed.WhichOneof("FeedUnion")
+    if which == "ltpc":
+        lt = feed.ltpc
+        r["ltpc"] = {"ltp": round(lt.ltp, 2), "cp": round(lt.cp, 2)}
+    elif which == "fullFeed":
+        ff = feed.fullFeed
+        ff_which = ff.WhichOneof("FullFeedUnion")
+        if ff_which == "marketFF":
+            mf = ff.marketFF
+            r["ltpc"] = {"ltp": round(mf.ltpc.ltp, 2), "cp": round(mf.ltpc.cp, 2)}
+            if mf.marketOHLC and mf.marketOHLC.ohlc:
+                ef = _ohlc_list_to_efeed(mf.marketOHLC.ohlc)
+                ef["ltp"] = round(mf.ltpc.ltp, 2)
+                ef["cp"]  = round(mf.ltpc.cp, 2)
+                ef["atp"] = round(mf.atp, 2) if mf.atp else 0
+                r["efeed"] = ef
+            if mf.optionGreeks and mf.optionGreeks.delta:
+                r["greeks"] = {
+                    "delta": round(mf.optionGreeks.delta, 4),
+                    "theta": round(mf.optionGreeks.theta, 4),
+                    "gamma": round(mf.optionGreeks.gamma, 6),
+                    "vega": round(mf.optionGreeks.vega, 4),
+                }
+            if mf.iv: r.setdefault("efeed",{})["iv"] = round(mf.iv, 2)
+            if mf.oi: r.setdefault("efeed",{})["oi"] = mf.oi
+        elif ff_which == "indexFF":
+            iff = ff.indexFF
+            r["ltpc"] = {"ltp": round(iff.ltpc.ltp, 2), "cp": round(iff.ltpc.cp, 2)}
+            if iff.marketOHLC and iff.marketOHLC.ohlc:
+                ef = _ohlc_list_to_efeed(iff.marketOHLC.ohlc)
+                ef["ltp"] = round(iff.ltpc.ltp, 2)
+                ef["cp"]  = round(iff.ltpc.cp, 2)
+                r["efeed"] = ef
+    elif which == "firstLevelWithGreeks":
+        fl = feed.firstLevelWithGreeks
+        r["ltpc"] = {"ltp": round(fl.ltpc.ltp, 2), "cp": round(fl.ltpc.cp, 2)}
+    return r
+
 def decode_v3(raw):
     try: return json.loads(raw.decode("utf-8"))
     except: pass
+    if _HAS_PB:
+        try:
+            resp = _pb.FeedResponse()
+            resp.ParseFromString(raw)
+            r = {"type": _TYPE_MAP.get(resp.type, "live_feed"),
+                 "feeds": {}, "currentTs": str(resp.currentTs or int(time.time()*1000))}
+            for key, feed in resp.feeds.items():
+                fd = _feed_to_dict(feed)
+                if fd: r["feeds"][key] = fd
+            if resp.marketInfo and resp.marketInfo.segmentStatus:
+                seg = {}
+                for name, status in resp.marketInfo.segmentStatus.items():
+                    seg[name] = _STATUS_MAP.get(status, "NORMAL_OPEN")
+                r["marketInfo"] = {"segmentStatus": seg}
+                r["type"] = "market_info"
+            return r if (r["feeds"] or r.get("marketInfo")) else None
+        except Exception as e:
+            print(f"[Decode-pb] {e}")
+    # Fallback to custom decoder
     try:
         r = {"type":"unknown","feeds":{},"currentTs":str(int(time.time()*1000))}
         i = 0; mt = 0
@@ -247,8 +329,20 @@ class AppState:
     frame_count: int = 0
     decode_ok:   int = 0
     subscribed_option_keys: set = set()
+    feed_log: list = []  # recent feed debug messages
 
 state = AppState()
+
+# Capture prints to feed_log
+import builtins
+_orig_print = builtins.print
+def _log_print(*args, **kwargs):
+    msg = " ".join(str(a) for a in args)
+    if msg.startswith("[Feed]") or msg.startswith("[Decode]"):
+        state.feed_log.append(f"{time.strftime('%H:%M:%S')} {msg}")
+        if len(state.feed_log) > 50: state.feed_log.pop(0)
+    _orig_print(*args, **kwargs)
+builtins.print = _log_print
 loc_engine = LOCEngine()
 
 async def _on_loc(symbol: str, result: dict):
@@ -436,7 +530,7 @@ async def startup_init():
     # Step 8: Re-subscribe Upstox feed to validated commodity keys
     if state.upstox_ws and COMMODITY_KEYS:
         try:
-            await _sub_text(state.upstox_ws, COMMODITY_KEYS, "full")
+            await _sub_binary(state.upstox_ws, COMMODITY_KEYS, "full")
             print(f"[Init] Re-subscribed MCX keys: {COMMODITY_KEYS}")
         except Exception as e:
             print(f"[Init] MCX re-sub error: {e}")
@@ -478,7 +572,7 @@ async def _subscribe_new_option_keys():
     new_keys = [k for k in loc_engine.get_option_keys()
                 if k and k not in state.subscribed_option_keys]
     if not new_keys: return
-    await _sub_text(state.upstox_ws, new_keys, "full")
+    await _sub_binary(state.upstox_ws, new_keys, "full")
     state.subscribed_option_keys.update(new_keys)
     for st in loc_engine.symbols.values():
         if st.ce.instrument_key: option_key_map[st.ce.instrument_key] = (st.symbol,"CE")
@@ -498,20 +592,26 @@ async def periodic_refresh():
 # ══════════════════════════════════════════════════════════════════
 #  WS SUBSCRIPTION — TEXT FRAME (not bytes!)
 # ══════════════════════════════════════════════════════════════════
-async def _sub_text(ws, keys: list, mode: str = "full"):
-    """Send subscription as JSON TEXT frame — Upstox v3 requirement."""
+async def _sub_binary(ws, keys: list, mode: str = "full"):
+    """Send subscription as BINARY frame — Upstox v3 requires binary opcode."""
     msg = json.dumps({
         "guid": f"raima_{int(time.time()*1000)}",
         "method": "sub",
         "data": {"mode": mode, "instrumentKeys": keys},
-    })
-    await ws.send(msg)   # TEXT frame
+    }).encode("utf-8")
+    print(f"[Feed] Subscribing {len(keys)} keys, mode={mode}")
+    await ws.send(msg)   # BINARY frame (bytes)
 
 def _ws_connect(url, headers):
+    import ssl as _ssl
     sig = inspect.signature(websockets.connect); p = sig.parameters
-    kw  = dict(ping_interval=20, ping_timeout=10)
-    if "extra_headers" in p: kw["extra_headers"] = headers
-    else:                    kw["additional_headers"] = headers
+    ctx = _ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = _ssl.CERT_NONE
+    kw  = dict(ping_interval=None, ping_timeout=None, max_size=2**24, ssl=ctx)
+    if headers:
+        if "extra_headers" in p: kw["extra_headers"] = headers
+        else:                    kw["additional_headers"] = headers
     return websockets.connect(url, **kw)
 
 
@@ -598,12 +698,26 @@ async def broadcast(msg: dict):
 # ══════════════════════════════════════════════════════════════════
 #  UPSTOX LIVE FEED
 # ══════════════════════════════════════════════════════════════════
+async def _get_authorized_ws_url(token: str) -> str:
+    """Get authorized WebSocket URL from Upstox v3 authorize endpoint."""
+    async with httpx.AsyncClient(timeout=15) as c:
+        r = await c.get("https://api.upstox.com/v3/feed/market-data-feed/authorize",
+                        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
+        if r.status_code == 200:
+            data = (r.json() or {}).get("data", {})
+            url = data.get("authorizedRedirectUri") or data.get("authorized_redirect_uri")
+            if url:
+                print(f"[Feed] Authorized WS URL obtained")
+                return url
+        print(f"[Feed] Authorize failed: {r.status_code} {r.text[:200]}")
+    return FEED_URL  # fallback
+
 async def start_feed():
     if USE_MOCK:
         from backend.mock_feed import start_mock_feed
         await start_mock_feed(broadcast); return
 
-    headers = {"Authorization": f"Bearer {state.access_token}", "Accept": "*/*"}
+    headers = {"Authorization": f"Bearer {state.access_token}"}
     while True:
         try:
             async with _ws_connect(FEED_URL, headers) as ws:
@@ -611,23 +725,23 @@ async def start_feed():
                 print("[Feed] ✓ Connected to Upstox V3 WebSocket")
 
                 # 1. Indices — full mode
-                await _sub_text(ws, INDEX_KEYS, "full")
+                await _sub_binary(ws, INDEX_KEYS, "full")
                 await asyncio.sleep(0.5)
 
                 # 2. Commodities — full mode (both current & next month)
-                await _sub_text(ws, COMMODITY_KEYS, "full")
+                await _sub_binary(ws, COMMODITY_KEYS, "full")
                 await asyncio.sleep(0.5)
 
                 # 3. F&O stocks (ISIN keys) — full mode for OHLC
                 stock_keys = list(dict.fromkeys(_ik.FO_STOCK_KEYS))
                 for i in range(0, len(stock_keys), 100):
-                    await _sub_text(ws, stock_keys[i:i+100], "full")
+                    await _sub_binary(ws, stock_keys[i:i+100], "full")
                     await asyncio.sleep(0.3)
 
                 # 4. Option CE/PE keys from chain
                 opt_keys = loc_engine.get_option_keys()
                 if opt_keys:
-                    await _sub_text(ws, opt_keys, "full")
+                    await _sub_binary(ws, opt_keys, "full")
                     state.subscribed_option_keys.update(opt_keys)
                     for st_sym in loc_engine.symbols.values():
                         if st_sym.ce.instrument_key:
@@ -640,23 +754,37 @@ async def start_feed():
                       f"{len(opt_keys)} options")
 
                 tick_n = 0
+                print(f"[Feed] Waiting for data...")
                 async for raw in ws:
                     state.frame_count += 1
+                    rtype = "binary" if isinstance(raw, bytes) else "text"
+                    rlen = len(raw) if raw else 0
                     try:
                         msg = (decode_v3(raw) if isinstance(raw,bytes)
                                else (json.loads(raw) if raw else None))
                         if msg and (msg.get("feeds") or msg.get("marketInfo")):
                             state.decode_ok += 1
+                            nf = len(msg.get("feeds",{}))
+                            mt = msg.get("type","?")
+                            if state.frame_count <= 10 or state.frame_count % 100 == 0:
+                                print(f"[Feed] Frame #{state.frame_count}: {rtype} {rlen}B → type={mt} feeds={nf}")
                             await broadcast(msg)
                             tick_n += 1
                             if tick_n % 300 == 0:
                                 await _subscribe_new_option_keys()
+                        else:
+                            print(f"[Feed] Frame #{state.frame_count}: {rtype} {rlen}B → decode returned None")
                     except Exception as ex:
-                        print(f"[Decode] {ex}")
+                        print(f"[Decode] Frame #{state.frame_count}: {rtype} {rlen}B → error: {ex}")
+                print("[Feed] WebSocket loop ended (server closed connection)")
 
         except asyncio.CancelledError: break
-        except Exception as e: print(f"[Feed] Reconnect: {e}")
+        except Exception as e:
+            import traceback
+            print(f"[Feed] Error: {e}")
+            traceback.print_exc()
         finally: state.upstox_ws = None
+        print("[Feed] Reconnecting in 5s...")
         await asyncio.sleep(5)
 
 
@@ -713,6 +841,10 @@ async def _restart():
 # ══════════════════════════════════════════════════════════════════
 #  DATA API ROUTES
 # ══════════════════════════════════════════════════════════════════
+@app.get("/api/feed-log")
+async def feed_log():
+    return {"log": state.feed_log[-30:]}
+
 @app.get("/api/status")
 async def api_status():
     return {
@@ -884,7 +1016,7 @@ async def debug_mcx():
 @app.post("/api/subscribe")
 async def subscribe(payload: dict):
     keys=payload.get("instrumentKeys",[]); mode=payload.get("mode","full")
-    if state.upstox_ws and keys: await _sub_text(state.upstox_ws, keys, mode)
+    if state.upstox_ws and keys: await _sub_binary(state.upstox_ws, keys, mode)
     return {"status":"ok"}
 
 _watchlists: dict = {}
