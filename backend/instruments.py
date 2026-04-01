@@ -348,16 +348,10 @@ async def fetch_option_chain(symbol: str, expiry: str, token: str) -> dict:
 # ── OHLC snapshot for stocks (v3 format) ─────────────────────────
 async def fetch_quotes_rest(keys: list, token: str) -> dict:
     """
-    Fetch OHLC for stocks/commodities using /v3/market-quote/ohlc.
-    v3 Response per key:
-    {
-      "last_price": 1234,
-      "instrument_token": "NSE_EQ|INE...",
-      "live_ohlc": {"open":x,"high":x,"low":x,"close":x,"volume":x,"ts":x},
-      "prev_ohlc": {"open":x,"high":x,"low":x,"close":x,"volume":x,"ts":x}
-    }
-    Falls back to v2 format if needed.
-    NOTE: Do NOT pass INDEX keys here — indices use /quotes not /ohlc
+    Fetch full quotes for stocks/commodities using /v2/market-quote/quotes.
+    Uses net_change to derive previous close (cp = ltp - net_change).
+    v3 OHLC returns prev_ohlc:null so we use v2 full quotes instead.
+    NOTE: Do NOT pass INDEX keys here — indices are handled by fetch_index_quotes.
     """
     if not keys or not token: return {}
     results = {}
@@ -370,63 +364,42 @@ async def fetch_quotes_rest(keys: list, token: str) -> dict:
         if not chunk: continue
         try:
             async with httpx.AsyncClient(timeout=20) as c:
-                r = await c.get(UPSTOX_OHLC_V3,
-                                params={"instrument_key": ",".join(chunk), "interval": "1d"},
+                r = await c.get(UPSTOX_QUOTE_V2,
+                                params={"instrument_key": ",".join(chunk)},
                                 headers=_h(token))
                 if r.status_code == 200:
                     resp_json = r.json()
                     data = resp_json.get("data") if resp_json else None
                     if data is None:
-                        print(f"[OHLC-v3] null data response")
+                        print(f"[Quote-v2] null data response")
                         continue
                     for resp_key, val in data.items():
                         if val is None: continue
                         try:
                             norm = normalize_response_key(resp_key.replace(":", "|", 1))
                             ltp  = float(val.get("last_price") or 0)
-                            # v3 has live_ohlc and prev_ohlc
-                            live = val.get("live_ohlc") or {}
-                            prev = val.get("prev_ohlc") or {}
-                            # prev_ohlc.close = yesterday's close (for change%)
-                            cp = float(prev.get("close") or 0)
-                            if not ltp: ltp = float(live.get("close") or cp or 0)
-                            o  = float(live.get("open")  or prev.get("open")  or ltp)
-                            h  = float(live.get("high")  or prev.get("high")  or ltp)
-                            l  = float(live.get("low")   or prev.get("low")   or ltp)
+                            ohlc = val.get("ohlc") or {}
+                            net_change = float(val.get("net_change") or 0)
+                            # Derive previous close from net_change
+                            cp = round(ltp - net_change, 2) if ltp and net_change else 0
+                            o  = float(ohlc.get("open")  or ltp)
+                            h  = float(ohlc.get("high")  or ltp)
+                            l  = float(ohlc.get("low")   or ltp)
                             if l == 0 and ltp: l = ltp
                             results[norm] = {
                                 "ltpc":  {"ltp": ltp, "cp": cp},
                                 "efeed": {"ltp": ltp, "cp": cp, "open": o, "high": h, "low": l},
                             }
                         except Exception as ex:
-                            print(f"[OHLC-v3] item error {resp_key}: {ex}")
-                    print(f"[OHLC-v3] chunk {i//50+1}: +{len(data)} items, total={len(results)}")
+                            print(f"[Quote-v2] item error {resp_key}: {ex}")
+                    print(f"[Quote-v2] chunk {i//50+1}: +{len(data)} items, total={len(results)}")
                 elif r.status_code == 429:
-                    print("[OHLC] Rate limited, waiting 2s...")
+                    print("[Quote] Rate limited, waiting 2s...")
                     await asyncio.sleep(2); continue
                 else:
-                    print(f"[OHLC-v3] HTTP {r.status_code} → trying v2...")
-                    # Fallback to v2
-                    r2 = await c.get(UPSTOX_OHLC_V2,
-                                     params={"instrument_key": ",".join(chunk), "interval": "1d"},
-                                     headers=_h(token))
-                    if r2.status_code == 200:
-                        data2 = (r2.json() or {}).get("data") or {}
-                        for resp_key, val in data2.items():
-                            if not val: continue
-                            norm = normalize_response_key(resp_key.replace(":", "|", 1))
-                            ohlc = val.get("ohlc") or {}
-                            ltp  = float(val.get("last_price") or ohlc.get("close") or 0)
-                            cp   = float(ohlc.get("close") or 0)
-                            results[norm] = {
-                                "ltpc":  {"ltp": ltp, "cp": cp},
-                                "efeed": {"ltp": ltp, "cp": cp,
-                                          "open": float(ohlc.get("open") or ltp),
-                                          "high": float(ohlc.get("high") or ltp),
-                                          "low":  float(ohlc.get("low")  or ltp)},
-                            }
+                    print(f"[Quote-v2] HTTP {r.status_code}")
         except Exception as e:
-            print(f"[OHLC] chunk error: {e}")
+            print(f"[Quote] chunk error: {e}")
         await asyncio.sleep(0.3)
     return results
 
@@ -435,6 +408,8 @@ async def fetch_index_quotes(index_keys: list, token: str) -> dict:
     """
     Fetch index LTP+OHLC via /v2/market-quote/quotes.
     Indices don't support the /ohlc endpoint.
+    Uses net_change to derive previous close (cp = ltp - net_change).
+    Note: ohlc.close in v2 equals current LTP, NOT yesterday's close.
     """
     if not index_keys or not token: return {}
     results = {}
@@ -450,7 +425,9 @@ async def fetch_index_quotes(index_keys: list, token: str) -> dict:
                     norm = resp_key.replace(":", "|", 1)
                     ohlc = val.get("ohlc") or {}
                     ltp  = float(val.get("last_price") or 0)
-                    cp   = float(ohlc.get("close") or 0)
+                    net_change = float(val.get("net_change") or 0)
+                    # Derive previous close from net_change (ohlc.close = current ltp, not prev close)
+                    cp = round(ltp - net_change, 2) if ltp else 0
                     o    = float(ohlc.get("open")  or ltp)
                     h    = float(ohlc.get("high")  or ltp)
                     l    = float(ohlc.get("low")   or ltp)
