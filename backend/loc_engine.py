@@ -82,24 +82,27 @@ def calc_loc_25(spot_ltp, spot_close, spot_high, spot_low, spot_open,
     f4 = sd(min(pe_lo, pe_c), max(sh, sc))
     f5 = sd(ce_l, s)
     f6 = sd(pe_l, s)
-    f7 = f1-f2; f8 = f3-f4; f9 = f7/2; f10 = f8/2
+    f7 = f1-f2; f8 = f3-f4; f9 = f7/2+f2; f10 = f8/2+f4
     ab = f5-f9; ac = f6-f10; f13 = f8-f7
 
     if   ab>0 and ac<0:             f15=abs(ab)+abs(ac)
     elif ab<0 and ac>0:             f15=abs(ab)+abs(ac)
     elif ab<0 and ac<0 and ab>ac:  f15=abs(ac)-abs(ab)
-    elif ab<0 and ac<0 and ab<ac:  f15=abs(ab)
-    else:                           f15=abs(ab-ac)
+    elif ab<0 and ac<0 and ab<ac:  f15=abs(ab)-abs(ac)
+    elif ab>0 and ac>0 and ab>ac:  f15=abs(ab-ac)
+    else:                           f15=abs(ac-ab)
 
     f16=f15*s
-    f17=s+f16 if ab<ac else(s-ac if ab>ac else s)
+    f17=s+f16 if ab<ac else(s-f16 if ab>ac else s)
     f18=s+abs(ab)*s if ab<0 else(s-abs(ab)*s if ab>0 else s)
     f19=s-abs(ac)*s if ac<0 else(s+abs(ac)*s if ac>0 else s)
     f20=f17*1.001; f21=f17*0.999; f22=f20-f18; f23=f21-f19
     f24=s+f22; f25=s+f23
 
-    zone=("CALL" if s>f17 and s>f18 and s>f19 else
-          "PUT"  if s<f17 and s<f18 and s<f19 else "WAIT")
+    # zone=("CALL" if s>f24 and s>f25 and s>f20 else
+    #       "PUT"  if s<f24 and s<f25 and s<f21 else "WAIT")
+    zone=("CALL" if s> max(f20, f21,f24,f25) else
+          "PUT"  if s< min(f20, f21,f24,f25) else "WAIT")
     chg=round(s-sc,2)
     r2=lambda x:round(x,2); r4=lambda x:round(x,4)
     return {
@@ -117,6 +120,7 @@ def calc_loc_25(spot_ltp, spot_close, spot_high, spot_low, spot_open,
         "c_ce_s":r4(f5),"c_pe_s":r4(f6),
         "zone":zone,"direction":"UP" if chg>=0 else "DOWN",
         "distance":r2(abs(s-f17)),
+        "f1":f1,"f2":f2,"f3":f3,"f4":f4,"f5":f5,"f6":f6,"f7":f7,"f8":f8,"f9":f9,"f10":f10,"f13":f13,"ab":ab,"ac":ac,"f15":f15,"f16":f16,"f17":f17,"f18":f18,"f19":f19,"f20":f20,"f21":f21,"f22":f22,"f23":f23,"f24":f24,"f25":f25,
     }
 
 
