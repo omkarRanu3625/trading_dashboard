@@ -401,6 +401,9 @@ def _route_tick(key, ltp, cp, o, h, l, ts):
 async def startup_init():
     global COMMODITY_KEYS, SPOT_KEYS_D, FEED_KEY_TO_SYM
 
+    # Wire up callback so chain refreshes trigger OHLC REST fetch immediately
+    loc_engine.on_option_ohlc_needed = _refresh_option_ohlc_single
+
     print("[Init] Starting data init...")
 
     # Step 1: Validate MCX keys
@@ -516,6 +519,13 @@ async def startup_init():
                 ef = v.get("efeed",{})
                 _update_ohlc(k, ltp, int(time.time()*1000),
                              ef.get("open",ltp), ef.get("high",ltp), ef.get("low",ltp))
+                # Feed OHLC into LOC engine so spot close/high/low are correct
+                sym = FEED_KEY_TO_SYM.get(k)
+                if sym and sym in LOC_SYMBOLS_SET:
+                    loc_engine.update_spot(
+                        sym, ltp, cp or ltp,
+                        ef.get("high", ltp), ef.get("low", ltp),
+                        int(time.time()*1000), ef.get("open", ltp))
         print(f"[Init] Snapshot loaded: {len(data)} instruments")
         await broadcast({
             "type":"snapshot_update",
@@ -540,30 +550,34 @@ async def startup_init():
         await _refresh_all_option_ohlc()
 
 
+async def _refresh_option_ohlc_single(symbol: str):
+    """Fetch actual intraday OHLC for a single symbol's CE/PE via REST."""
+    if not state.access_token: return
+    st = loc_engine.get_state(symbol)
+    if not st or not st.ce.instrument_key: return
+    data = await fetch_option_ohlc_rest(
+        st.ce.instrument_key, st.pe.instrument_key, state.access_token)
+    if not data: return
+    ce_d = data.get(st.ce.instrument_key, {})
+    pe_d = data.get(st.pe.instrument_key, {})
+    if ce_d:
+        st.ce.ltp   = ce_d["ltp"]   or ce_d["close"] or st.ce.ltp
+        st.ce.close = ce_d["close"]  or st.ce.close
+        st.ce.high  = ce_d["high"]   or st.ce.high or st.ce.ltp
+        st.ce.low   = ce_d["low"]    or st.ce.low  or st.ce.ltp
+    if pe_d:
+        st.pe.ltp   = pe_d["ltp"]   or pe_d["close"] or st.pe.ltp
+        st.pe.close = pe_d["close"]  or st.pe.close
+        st.pe.high  = pe_d["high"]   or st.pe.high or st.pe.ltp
+        st.pe.low   = pe_d["low"]    or st.pe.low  or st.pe.ltp
+    if ce_d.get("ltp") or pe_d.get("ltp"):
+        loc_engine.recalc(symbol)
+
+
 async def _refresh_all_option_ohlc():
     """Fetch full OHLC for all CE/PE options via REST."""
-    if not state.access_token: return
     for sym in LOC_SYMBOLS:
-        st = loc_engine.get_state(sym)
-        if not st or not st.ce.instrument_key: continue
-        data = await fetch_option_ohlc_rest(
-            st.ce.instrument_key, st.pe.instrument_key, state.access_token)
-        if data:
-            ce_d = data.get(st.ce.instrument_key, {})
-            pe_d = data.get(st.pe.instrument_key, {})
-            if ce_d:
-                st.ce.ltp   = ce_d["ltp"]   or ce_d["close"] or st.ce.ltp
-                st.ce.close = ce_d["close"]  or st.ce.close
-                st.ce.high  = ce_d["high"]   or st.ce.high or st.ce.ltp
-                st.ce.low   = ce_d["low"]    or st.ce.low  or st.ce.ltp
-            if pe_d:
-                st.pe.ltp   = pe_d["ltp"]   or pe_d["close"] or st.pe.ltp
-                st.pe.close = pe_d["close"]  or st.pe.close
-                st.pe.high  = pe_d["high"]   or st.pe.high or st.pe.ltp
-                st.pe.low   = pe_d["low"]    or st.pe.low  or st.pe.ltp
-            if ce_d.get("ltp") or pe_d.get("ltp"):
-                print(f"[Init] {sym} opts CE={ce_d.get('ltp',0)} PE={pe_d.get('ltp',0)}")
-                loc_engine.recalc(sym)
+        await _refresh_option_ohlc_single(sym)
         await asyncio.sleep(0.15)
 
 
@@ -584,8 +598,6 @@ async def periodic_refresh():
         await asyncio.sleep(60)
         if not state.access_token: continue
         await loc_engine.refresh_all_chains()
-        await asyncio.sleep(1)
-        await _refresh_all_option_ohlc()
         await _subscribe_new_option_keys()
 
 
@@ -891,7 +903,7 @@ async def _refresh_chain_and_sub(sym: str, expiry: str):
     chain = await fetch_option_chain(sym, expiry, state.access_token)
     if chain: loc_engine.update_chain(sym, chain)
     await asyncio.sleep(0.5)
-    await _refresh_all_option_ohlc()
+    await _refresh_option_ohlc_single(sym)
     await _subscribe_new_option_keys()
 
 @app.get("/api/ohlc/{key:path}")
