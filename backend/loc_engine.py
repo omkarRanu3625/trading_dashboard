@@ -129,6 +129,7 @@ class LOCEngine:
         self.symbols:Dict[str,SymbolState]={}
         self.access_token:str=""
         self.on_loc_update:Optional[Callable]=None
+        self.on_option_ohlc_needed:Optional[Callable]=None   # (symbol) → fetch OHLC REST
         self.chain_fetch_time:Dict[str,float]={}
 
     def register(self, symbol:str):
@@ -263,27 +264,50 @@ class LOCEngine:
 
         if ce_row.get("CE"):
             c = ce_row["CE"]
+            new_ce_key = c.get("key", "")
+            key_changed = (new_ce_key and new_ce_key != st.ce.instrument_key)
             ltp   = _best(c.get("ltp"), c.get("close"))
             close = _best(c.get("close"), c.get("ltp"))
             st.ce.ltp   = ltp
             st.ce.close = close
-            st.ce.high  = _best(c.get("high"), ltp)
-            st.ce.low   = _best(c.get("low"),  ltp)
+            # Only overwrite high/low from chain if chain has actual values.
+            # If chain returns 0/None, preserve existing values from OHLC REST.
+            # Reset to ltp only when the option instrument changed (ATM shift).
+            chain_high = _best(c.get("high"))
+            chain_low  = _best(c.get("low"))
+            if chain_high:
+                st.ce.high = chain_high
+            elif key_changed or not st.ce.high:
+                st.ce.high = ltp
+            if chain_low:
+                st.ce.low = chain_low
+            elif key_changed or not st.ce.low:
+                st.ce.low = ltp
             st.ce.oi    = float(c.get("oi") or 0)
             st.ce.iv    = float(c.get("iv") or 0)
-            st.ce.instrument_key = c.get("key", "")
+            st.ce.instrument_key = new_ce_key or st.ce.instrument_key
 
         if pe_row.get("PE"):
             p = pe_row["PE"]
+            new_pe_key = p.get("key", "")
+            key_changed = (new_pe_key and new_pe_key != st.pe.instrument_key)
             ltp   = _best(p.get("ltp"), p.get("close"))
             close = _best(p.get("close"), p.get("ltp"))
             st.pe.ltp   = ltp
             st.pe.close = close
-            st.pe.high  = _best(p.get("high"), ltp)
-            st.pe.low   = _best(p.get("low"),  ltp)
+            chain_high = _best(p.get("high"))
+            chain_low  = _best(p.get("low"))
+            if chain_high:
+                st.pe.high = chain_high
+            elif key_changed or not st.pe.high:
+                st.pe.high = ltp
+            if chain_low:
+                st.pe.low = chain_low
+            elif key_changed or not st.pe.low:
+                st.pe.low = ltp
             st.pe.oi    = float(p.get("oi") or 0)
             st.pe.iv    = float(p.get("iv") or 0)
-            st.pe.instrument_key = p.get("key", "")
+            st.pe.instrument_key = new_pe_key or st.pe.instrument_key
 
         print(f"[LOC] {symbol} loaded: "
               f"CE@{st.ce_strike}=ltp:{st.ce.ltp} close:{st.ce.close} "
@@ -315,6 +339,8 @@ class LOCEngine:
         )
         res.update({
             "symbol":symbol,
+            "spot_high": round(st.spot.high or spot_ltp, 2),
+            "spot_low":  round(st.spot.low  or spot_ltp, 2),
             "ce_strike": st.ce_strike,
             "pe_strike": st.pe_strike,
             "expiry":    st.expiry,
@@ -348,6 +374,9 @@ class LOCEngine:
         chain = await fetch_option_chain(symbol, st.expiry, self.access_token)
         if chain:
             self.update_chain(symbol, chain)
+            # Immediately fetch actual OHLC (chain API lacks intraday high/low)
+            if self.on_option_ohlc_needed:
+                await self.on_option_ohlc_needed(symbol)
 
     async def refresh_all_chains(self):
         for sym in list(self.symbols.keys()):

@@ -442,7 +442,10 @@ async def fetch_index_quotes(index_keys: list, token: str) -> dict:
 
 
 async def fetch_option_ohlc_rest(ce_key: str, pe_key: str, token: str) -> dict:
-    """Get full OHLC for CE and PE option keys via /v2/market-quote/quotes."""
+    """Get full OHLC for CE and PE option keys via /v2/market-quote/quotes.
+    Note: ohlc.close = today's close (= LTP), NOT previous close.
+    Previous close is derived from net_change: cp = ltp - net_change.
+    """
     if not token: return {}
     keys = [k for k in [ce_key, pe_key] if k]
     if not keys: return {}
@@ -454,20 +457,39 @@ async def fetch_option_ohlc_rest(ce_key: str, pe_key: str, token: str) -> dict:
                             headers=_h(token))
             if r.status_code == 200:
                 data = (r.json() or {}).get("data") or {}
-                for orig_key in keys:
-                    # Upstox returns with colon: "NSE_FO:NIFTY..."
-                    colon_key = orig_key.replace("|", ":", 1)
-                    val = data.get(orig_key) or data.get(colon_key) or {}
-                    if val:
-                        ohlc = val.get("ohlc") or {}
-                        result[orig_key] = {
-                            "ltp":   float(val.get("last_price") or 0),
-                            "close": float(ohlc.get("close") or 0),
-                            "high":  float(ohlc.get("high")  or 0),
-                            "low":   float(ohlc.get("low")   or 0),
-                            "open":  float(ohlc.get("open")  or 0),
-                            "oi":    float(val.get("oi")      or 0),
-                        }
+                # API returns keys in trading-symbol format (e.g. NSE_FO:NIFTY2640722600CE)
+                # which differs from numeric instrument_key (NSE_FO|40738).
+                # Match by iterating response and detecting CE/PE from key suffix.
+                for resp_key, val in data.items():
+                    if not val: continue
+                    # Try direct key match first
+                    matched_key = None
+                    pipe_key = resp_key.replace(":", "|", 1)
+                    for orig_key in keys:
+                        if orig_key == pipe_key or orig_key == resp_key:
+                            matched_key = orig_key
+                            break
+                    if not matched_key:
+                        # Fallback: match by CE/PE suffix
+                        if resp_key.endswith("CE") and ce_key:
+                            matched_key = ce_key
+                        elif resp_key.endswith("PE") and pe_key:
+                            matched_key = pe_key
+                    if not matched_key:
+                        continue
+                    ohlc = val.get("ohlc") or {}
+                    ltp = float(val.get("last_price") or 0)
+                    net_change = float(val.get("net_change") or 0)
+                    # Derive previous close from net_change (ohlc.close = today's close = LTP)
+                    prev_close = round(ltp - net_change, 2) if ltp and net_change else 0
+                    result[matched_key] = {
+                        "ltp":   ltp,
+                        "close": prev_close,
+                        "high":  float(ohlc.get("high")  or 0),
+                        "low":   float(ohlc.get("low")   or 0),
+                        "open":  float(ohlc.get("open")  or 0),
+                        "oi":    float(val.get("oi")      or 0),
+                    }
     except Exception as e:
         print(f"[OptOHLC] {e}")
     return result
